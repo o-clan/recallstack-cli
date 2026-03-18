@@ -4,6 +4,9 @@
   "description": "Recallstack CLI",
   "license": "MIT",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/o-clan/recallstack-cli.git"
