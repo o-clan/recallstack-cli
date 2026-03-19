@@ -28,7 +28,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "npm run build && tsx --test src/*.test.ts src/**/*.test.ts"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",

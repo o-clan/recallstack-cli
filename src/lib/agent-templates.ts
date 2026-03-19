@@ -2010,7 +2010,7 @@ Codex hook behavior (installed by \`recallstack agent install codex\`):
 3. The background worker reads the latest completed turn from the Codex transcript.
 4. The worker runs an ephemeral \`codex exec --ephemeral --disable codex_hooks\` extraction pass to turn the transcript slice into a Recallstack-ready summary.
 5. Set the background extraction model by reinstalling with \`recallstack agent install codex --worker-model <model>\`.
-6. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours.
+6. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours. Auth-required ingest failures are also cached locally and replayed after the next successful login.
 7. The worker ingests that processed summary into the selected non-global project.
 8. Because ingest is hook-driven, do not spend thread space describing memory housekeeping.
 
@@ -2069,7 +2069,7 @@ Claude hook behavior (installed by \`recallstack agent install claude\`):
 2. The background worker reads the latest completed turn from the Claude transcript and current Stop payload.
 3. The worker runs a headless \`claude -p --output-format json --json-schema ... --no-session-persistence\` extraction pass to produce a clean Recallstack summary without polluting the user's normal thread history.
 4. Set the background extraction model by reinstalling with \`recallstack agent install claude --worker-model <model>\`.
-5. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours.
+5. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours. Auth-required ingest failures are also cached locally and replayed after the next successful login.
 6. The hook ingests that processed summary into the selected non-global project.
 7. Because ingest is hook-driven, do not spend thread space describing memory housekeeping.
 
@@ -2756,7 +2756,7 @@ Cursor IDE hook behavior (installed by \`recallstack agent install cursor\`):
 2. \`beforeSubmitPrompt\` captures the latest user prompt.
 3. \`afterAgentResponse\` captures the latest agent response text.
 4. \`stop\` queues background processing and returns immediately so editor interaction is not delayed.
-5. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours.
+5. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours. Auth-required ingest failures are also cached locally and replayed after the next successful login.
 6. The background worker pairs the captured prompt and response, condenses them into a clean turn memory, and ingests that summary into the selected non-global project.
 7. Because ingest is hook-driven, do not spend thread space describing memory housekeeping.
 
@@ -3859,7 +3859,7 @@ GitHub Copilot hook behavior (installed by \`recallstack agent install copilot\`
 4. Both variants point to the same Recallstack hook worker.
 5. The worker reconstructs the finished turn from Copilot transcript/session-state artifacts, then runs a headless \`copilot -p\` extraction pass from an isolated temp config dir so the user's normal Copilot history is not polluted.
 6. Set the background extraction model by reinstalling with \`recallstack agent install copilot --worker-model <model>\`.
-7. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours.
+7. Retryable ingest failures such as rate limits or unavailable backend responses are cached locally and retried in the background for up to 24 hours. Auth-required ingest failures are also cached locally and replayed after the next successful login.
 8. Stop/session-end processing is queued in the background so the agent loop is not delayed.
 9. Because ingest is hook-driven, do not spend thread space describing memory housekeeping.
 

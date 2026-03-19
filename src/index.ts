@@ -16,6 +16,7 @@ import {
 } from "./lib/config.js";
 import { authenticatedHttp, loginWithCode, logout } from "./lib/auth.js";
 import { formatStructuredQueryForCli } from "./lib/format-structured-query.js";
+import { authQueueReason, flushPendingWrites, isAuthRequiredError, queuePendingWrite } from "./lib/pending-writes.js";
 import { emitCliTelemetry } from "./lib/telemetry.js";
 import { withCliSpan } from "./lib/tracing.js";
 import {
@@ -42,8 +43,11 @@ type AgentInstallOptions = { workerModel?: string; scope?: AgentInstallScope };
 type WorkspaceRecallstackConfig = {
   workspace_id?: string;
   workspace_slug?: string;
+  workspace_name?: string;
   project_id?: string;
   project_slug?: string;
+  project_name?: string;
+  project_mode?: "GLOBAL" | "PROJECT";
   project?: string;
   workspace_root?: string;
   updated_at?: string;
@@ -149,6 +153,59 @@ function assertExactlyOneInputSource(options: { file?: string; stdin?: boolean }
 function assertValidDiffProofMode(mode: string): asserts mode is "advisory" | "strict" {
   if (mode !== "advisory" && mode !== "strict") {
     throw new Error('Invalid --diff-proof-mode. Use "advisory" or "strict".');
+  }
+}
+
+function queuedMemoryFooter(queueId: string): string {
+  return `Memory updated: pending local sync (reason=AUTH_REQUIRED, queue=${queueId})`;
+}
+
+function queueMemoryWrite(input: {
+  config: ReturnType<typeof loadConfig>;
+  kind: "event" | "source";
+  target: Pick<ResolvedTarget, "workspaceId" | "projectSlug">;
+  body: JsonRecord;
+  error: unknown;
+  cwd: string;
+  summary: string;
+}): JsonRecord {
+  const queued = queuePendingWrite({
+    kind: input.kind,
+    baseUrl: getRuntimeBaseUrl(input.config),
+    workspaceId: input.target.workspaceId,
+    projectToken: input.target.projectSlug,
+    body: input.body,
+    origin: "cli",
+    cwd: input.cwd,
+    queueReason: authQueueReason(input.error),
+    lastError: {
+      message: input.error instanceof Error ? input.error.message : String(input.error),
+      ...(typeof input.error === "object" && input.error !== null && typeof (input.error as { code?: unknown }).code === "string"
+        ? { code: (input.error as { code: string }).code }
+        : {}),
+    },
+  });
+  return {
+    status: "queued_local",
+    queued_local: true,
+    duplicate: queued.duplicate,
+    queue_id: queued.record.id,
+    sync_status: "pending_login",
+    project_id: input.target.projectSlug,
+    message: input.summary,
+    memory_footer: queuedMemoryFooter(queued.record.id),
+  };
+}
+
+async function flushQueuedWritesAfterLogin(config: ReturnType<typeof loadConfig>): Promise<void> {
+  const replay = await flushPendingWrites({ config });
+  if (replay.replayed > 0) {
+    const label = replay.replayed === 1 ? "write" : "writes";
+    console.log(`Replayed ${replay.replayed} queued memory ${label}.`);
+  }
+  if (replay.remaining > 0) {
+    const label = replay.remaining === 1 ? "write is" : "writes are";
+    console.warn(`${replay.remaining} queued memory ${label} still pending.`);
   }
 }
 
@@ -1148,31 +1205,64 @@ function findWorkspaceConfig(startCwd: string): { path?: string; config: Workspa
 function readStoredTarget(config: WorkspaceRecallstackConfig): {
   workspaceId?: string;
   workspaceSlug?: string;
+  workspaceName?: string;
   projectId?: string;
   projectSlug?: string;
+  projectName?: string;
+  projectMode?: "GLOBAL" | "PROJECT";
 } | undefined {
   const workspaceSlug = normalizeValue(config.workspace_slug);
   const projectSlug = normalizeValue(config.project_slug);
   const workspaceId = normalizeValue(config.workspace_id);
   const projectId = normalizeValue(config.project_id);
+  const workspaceName = normalizeValue(config.workspace_name);
+  const projectName = normalizeValue(config.project_name);
+  const projectMode = config.project_mode === "GLOBAL" || config.project_mode === "PROJECT"
+    ? config.project_mode
+    : undefined;
 
   if (workspaceSlug && projectSlug) {
     return {
       workspaceId,
       workspaceSlug,
+      workspaceName,
       projectId,
       projectSlug,
+      projectName,
+      projectMode,
     };
   }
 
   if (workspaceId && projectSlug) {
     return {
       workspaceId,
+      workspaceSlug,
+      workspaceName,
       projectSlug,
+      projectId,
+      projectName,
+      projectMode,
     };
   }
 
   return undefined;
+}
+
+function fallbackTargetFromStored(stored: ReturnType<typeof readStoredTarget>): ResolvedTarget | undefined {
+  if (!stored?.workspaceId || !stored.projectSlug) {
+    return undefined;
+  }
+  const projectMode = stored.projectMode
+    || (stored.projectSlug === "global" ? "GLOBAL" : "PROJECT");
+  return {
+    workspaceId: stored.workspaceId,
+    workspaceSlug: stored.workspaceSlug || stored.workspaceId,
+    workspaceName: stored.workspaceName || stored.workspaceSlug || "Stored workspace",
+    projectId: stored.projectId || stored.projectSlug,
+    projectSlug: stored.projectSlug,
+    projectName: stored.projectName || stored.projectSlug,
+    mode: projectMode,
+  };
 }
 
 function saveWorkspaceTarget(cwd: string, target: ResolvedTarget): string {
@@ -1182,8 +1272,11 @@ function saveWorkspaceTarget(cwd: string, target: ResolvedTarget): string {
     ...existing,
     workspace_id: target.workspaceId,
     workspace_slug: target.workspaceSlug,
+    workspace_name: target.workspaceName,
     project_id: target.projectId,
     project_slug: target.projectSlug,
+    project_name: target.projectName,
+    project_mode: target.mode,
     project: undefined,
     workspace_root: cwd,
     updated_at: new Date().toISOString(),
@@ -1198,8 +1291,11 @@ function clearWorkspaceTarget(cwd: string): string {
     ...existing,
     workspace_id: undefined,
     workspace_slug: undefined,
+    workspace_name: undefined,
     project_id: undefined,
     project_slug: undefined,
+    project_name: undefined,
+    project_mode: undefined,
     project: undefined,
     workspace_root: cwd,
     updated_at: new Date().toISOString(),
@@ -1497,35 +1593,72 @@ async function loadLocalTarget(cwd: string, config: ReturnType<typeof loadConfig
   }
 
   const stored = readStoredTarget(workspaceConfig.config);
+  const fallback = fallbackTargetFromStored(stored);
   if (stored?.workspaceSlug && stored.projectSlug) {
     try {
-      const resolved = await resolveTargetByCanonicalInput(config, {
-        workspaceSlug: stored.workspaceSlug,
-        projectSlug: stored.projectSlug,
-      });
-      const hasIdDrift = stored.workspaceId !== resolved.workspaceId || stored.projectId !== resolved.projectId;
-      if (hasIdDrift) {
-        saveWorkspaceTarget(cwd, resolved);
-      }
-      return resolved;
-    } catch (error) {
-      if (!stored.workspaceId) {
-        throw error;
-      }
+      try {
+        const resolved = await resolveTargetByCanonicalInput(config, {
+          workspaceSlug: stored.workspaceSlug,
+          projectSlug: stored.projectSlug,
+        });
+        const hasIdDrift = stored.workspaceId !== resolved.workspaceId || stored.projectId !== resolved.projectId;
+        if (hasIdDrift) {
+          saveWorkspaceTarget(cwd, resolved);
+        }
+        return resolved;
+      } catch (error) {
+        if (!stored.workspaceId) {
+          throw error;
+        }
 
+        const workspaces = await listWorkspaces(config);
+        const workspace = workspaces.find((item) => item.id === stored.workspaceId);
+        if (!workspace) {
+          throw error;
+        }
+
+        const projects = await listProjectsForWorkspace(config, workspace.id);
+        const project = projects.find((item) => (
+          (stored.projectId && item.id === stored.projectId)
+          || item.slug === stored.projectSlug
+        ));
+        if (!project) {
+          throw error;
+        }
+
+        const resolved: ResolvedTarget = {
+          workspaceId: workspace.id,
+          workspaceSlug: workspace.slug,
+          workspaceName: workspace.name,
+          projectId: project.id,
+          projectSlug: project.slug,
+          projectName: project.name,
+          mode: project.mode,
+        };
+        saveWorkspaceTarget(cwd, resolved);
+        console.warn(`Repaired drifted target mapping to canonical format: ${formatCanonicalTarget({ workspaceSlug: resolved.workspaceSlug, projectSlug: resolved.projectSlug })}`);
+        return resolved;
+      }
+    } catch (error) {
+      if (fallback) {
+        return fallback;
+      }
+      throw error;
+    }
+  }
+
+  if (stored?.workspaceId && stored.projectSlug) {
+    try {
       const workspaces = await listWorkspaces(config);
       const workspace = workspaces.find((item) => item.id === stored.workspaceId);
       if (!workspace) {
-        throw error;
+        throw new Error("Stored workspace target is no longer accessible. Run `recallstack project use`.");
       }
 
       const projects = await listProjectsForWorkspace(config, workspace.id);
-      const project = projects.find((item) => (
-        (stored.projectId && item.id === stored.projectId)
-        || item.slug === stored.projectSlug
-      ));
+      const project = projects.find((item) => item.slug === stored.projectSlug || (stored.projectId && item.id === stored.projectId));
       if (!project) {
-        throw error;
+        throw new Error("Stored project target is no longer accessible. Run `recallstack project use`.");
       }
 
       const resolved: ResolvedTarget = {
@@ -1538,36 +1671,14 @@ async function loadLocalTarget(cwd: string, config: ReturnType<typeof loadConfig
         mode: project.mode,
       };
       saveWorkspaceTarget(cwd, resolved);
-      console.warn(`Repaired drifted target mapping to canonical format: ${formatCanonicalTarget({ workspaceSlug: resolved.workspaceSlug, projectSlug: resolved.projectSlug })}`);
+      console.warn(`Migrated workspace target to canonical format: ${formatCanonicalTarget({ workspaceSlug: resolved.workspaceSlug, projectSlug: resolved.projectSlug })}`);
       return resolved;
+    } catch (error) {
+      if (fallback) {
+        return fallback;
+      }
+      throw error;
     }
-  }
-
-  if (stored?.workspaceId && stored.projectSlug) {
-    const workspaces = await listWorkspaces(config);
-    const workspace = workspaces.find((item) => item.id === stored.workspaceId);
-    if (!workspace) {
-      throw new Error("Stored workspace target is no longer accessible. Run `recallstack project use`.");
-    }
-
-    const projects = await listProjectsForWorkspace(config, workspace.id);
-    const project = projects.find((item) => item.slug === stored.projectSlug || (stored.projectId && item.id === stored.projectId));
-    if (!project) {
-      throw new Error("Stored project target is no longer accessible. Run `recallstack project use`.");
-    }
-
-    const resolved: ResolvedTarget = {
-      workspaceId: workspace.id,
-      workspaceSlug: workspace.slug,
-      workspaceName: workspace.name,
-      projectId: project.id,
-      projectSlug: project.slug,
-      projectName: project.name,
-      mode: project.mode,
-    };
-    saveWorkspaceTarget(cwd, resolved);
-    console.warn(`Migrated workspace target to canonical format: ${formatCanonicalTarget({ workspaceSlug: resolved.workspaceSlug, projectSlug: resolved.projectSlug })}`);
-    return resolved;
   }
 
   const legacyProject = normalizeValue(workspaceConfig.config.project);
@@ -2586,6 +2697,7 @@ program
       try {
         await loginWithCode(code, cfg);
         const updatedCfg = getRuntimeConfig();
+        await flushQueuedWritesAfterLogin(updatedCfg);
         await emitCliTelemetry(updatedCfg, {
           eventName: "cli.auth.login",
           operation: "cli.login",
@@ -3111,20 +3223,22 @@ memory
       };
     }
 
+    const requestBody: JsonRecord = {
+      project_id: selectedTarget.projectSlug,
+      content,
+      metadata: {
+        ...(metadata || {}),
+        ...(options.turnId ? { turn_id: options.turnId } : {}),
+      },
+      diff_proof: diffProof,
+      force_event: Boolean(options.forceEvent),
+      idempotency_key: options.idempotencyKey || `cli-${Date.now()}`,
+    };
+
     try {
       const out = await authenticatedHttp<any>("/v1/memory/events", {
         method: "POST",
-        body: {
-          project_id: selectedTarget.projectSlug,
-          content,
-          metadata: {
-            ...(metadata || {}),
-            ...(options.turnId ? { turn_id: options.turnId } : {}),
-          },
-          diff_proof: diffProof,
-          force_event: Boolean(options.forceEvent),
-          idempotency_key: options.idempotencyKey || `cli-${Date.now()}`,
-        },
+        body: requestBody,
         workspaceId: selectedTarget.workspaceId,
       }, cfg);
 
@@ -3149,6 +3263,33 @@ memory
         : "Memory updated: yes (status=not_applied)";
       console.log(JSON.stringify({ ...out, memory_footer: footer }, null, 2));
     } catch (error) {
+      if (isAuthRequiredError(error)) {
+        const queued = queueMemoryWrite({
+          config: cfg,
+          kind: "event",
+          target: selectedTarget,
+          body: requestBody,
+          error,
+          cwd: process.cwd(),
+          summary: "Memory saved locally and will sync after login.",
+        });
+        await emitCliTelemetry(cfg, {
+          eventName: "cli.memory.ingest",
+          operation: "cli.memory.ingest",
+          durationMs: Date.now() - startedAt,
+          projectId: selectedTarget.projectSlug,
+          attributes: {
+            workspace_slug: selectedTarget.workspaceSlug,
+            project_slug: selectedTarget.projectSlug,
+            queued_local: true,
+            queue_reason: authQueueReason(error),
+            diff_proof_enabled: enableDiffProof,
+            turn_id: options.turnId || null,
+          },
+        });
+        console.log(JSON.stringify(queued, null, 2));
+        return;
+      }
       await emitCliTelemetry(cfg, {
         eventName: "cli.memory.ingest",
         operation: "cli.memory.ingest",
@@ -3373,17 +3514,19 @@ memorySource
       }
     }
 
+    const requestBody: JsonRecord = {
+      project_id: selectedTarget.projectSlug,
+      title: options.title,
+      source_type: options.sourceType,
+      uri: options.uri,
+      content,
+      metadata,
+    };
+
     try {
       const out = await authenticatedHttp<any>("/v1/memory/sources", {
         method: "POST",
-        body: {
-          project_id: selectedTarget.projectSlug,
-          title: options.title,
-          source_type: options.sourceType,
-          uri: options.uri,
-          content,
-          metadata,
-        },
+        body: requestBody,
         workspaceId: selectedTarget.workspaceId,
       }, cfg);
 
@@ -3401,6 +3544,32 @@ memorySource
       });
       console.log(JSON.stringify(out, null, 2));
     } catch (error) {
+      if (isAuthRequiredError(error)) {
+        const queued = queueMemoryWrite({
+          config: cfg,
+          kind: "source",
+          target: selectedTarget,
+          body: requestBody,
+          error,
+          cwd: process.cwd(),
+          summary: "Durable source saved locally and will sync after login.",
+        });
+        await emitCliTelemetry(cfg, {
+          eventName: "cli.memory.source.ingest",
+          operation: "cli.memory.source.ingest",
+          durationMs: Date.now() - startedAt,
+          projectId: selectedTarget.projectSlug,
+          attributes: {
+            workspace_slug: selectedTarget.workspaceSlug,
+            project_slug: selectedTarget.projectSlug,
+            source_type: options.sourceType,
+            queued_local: true,
+            queue_reason: authQueueReason(error),
+          },
+        });
+        console.log(JSON.stringify(queued, null, 2));
+        return;
+      }
       await emitCliTelemetry(cfg, {
         eventName: "cli.memory.source.ingest",
         operation: "cli.memory.source.ingest",

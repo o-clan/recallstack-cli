@@ -39,6 +39,8 @@ recallstack agent install codex
 
 The CLI stores its auth profile on the local machine so it can reuse your session across commands. Review the source before use if you want to audit or modify that behavior.
 
+Memory writes that cannot be sent because authentication is missing or expired are now queued locally and replayed after the next successful login. Hook-driven turn ingests use the same protection.
+
 ## Public Source
 
 This repository is the public source mirror for the Recallstack CLI package published to npm. The packaged CLI is intended to be auditable and forkable.
