@@ -1,4 +1,5 @@
-import { CLI_CLIENT_ID, injectTraceHeaders, withCliHttpSpan } from "./tracing.js";
+import { injectTraceHeaders, withCliHttpSpan } from "./tracing.js";
+import { CLI_CLIENT_ID } from "./version.js";
 
 export class HttpError extends Error {
   readonly status: number;

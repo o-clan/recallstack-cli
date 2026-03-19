@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   context,
   defaultTextMapSetter,
@@ -21,6 +18,7 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { getEffectiveBaseUrl, type RecallstackConfig } from "./config.js";
+import { CLI_CLIENT_ID } from "./version.js";
 
 type TraceAttributeValue = string | number | boolean | null;
 
@@ -57,22 +55,6 @@ function traceIdHexToUuid(traceId: string): string {
     normalized.slice(20),
   ].join("-");
 }
-
-function resolveCliClientId(): string {
-  try {
-    const currentDir = dirname(fileURLToPath(import.meta.url));
-    const packagePath = resolve(currentDir, "../../package.json");
-    const parsed = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: unknown };
-    const version = typeof parsed.version === "string" && parsed.version.trim().length > 0
-      ? parsed.version.trim()
-      : "0.0.0";
-    return `recallstack-cli/${version}`;
-  } catch {
-    return "recallstack-cli/0.0.0";
-  }
-}
-
-export const CLI_CLIENT_ID = resolveCliClientId();
 
 let provider: NodeTracerProvider | null = null;
 let initialized = false;

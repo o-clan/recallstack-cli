@@ -19,6 +19,7 @@ import { formatStructuredQueryForCli } from "./lib/format-structured-query.js";
 import { authQueueReason, flushPendingWrites, isAuthRequiredError, queuePendingWrite } from "./lib/pending-writes.js";
 import { emitCliTelemetry } from "./lib/telemetry.js";
 import { withCliSpan } from "./lib/tracing.js";
+import { CLI_PACKAGE_VERSION } from "./lib/version.js";
 import {
   CLAUDE_HOOK_TEMPLATE,
   CLAUDE_SKILL_TEMPLATE,
@@ -2038,7 +2039,7 @@ function installCopilotIntegration(cwd: string, options: AgentInstallOptions = {
     writeExecutableScript(copilot.hookPath, COPILOT_HOOK_TEMPLATE);
     writeJsonFile(copilot.pluginManifestPath, {
       name: "recallstack",
-      version: "1.0.0",
+      version: CLI_PACKAGE_VERSION,
       description: "Recallstack memory retrieval guidance and hook automation.",
       skills: ["skills/"],
       hooks: "hooks.json",
@@ -2676,7 +2677,7 @@ async function setTargetCommand(targetArg: string | undefined, options: { cwd: s
 program
   .name("recallstack")
   .description("Recallstack CLI")
-  .version("1.0.0");
+  .version(CLI_PACKAGE_VERSION);
 
 program
   .command("login")
