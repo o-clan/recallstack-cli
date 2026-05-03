@@ -16,7 +16,13 @@ import {
 } from "./lib/config.js";
 import { authenticatedHttp, loginWithCode, logout } from "./lib/auth.js";
 import { formatStructuredQueryForCli } from "./lib/format-structured-query.js";
-import { authQueueReason, flushPendingWrites, isAuthRequiredError, queuePendingWrite } from "./lib/pending-writes.js";
+import {
+  authQueueReason,
+  flushPendingWrites,
+  isAuthRequiredError,
+  listPendingWrites,
+  queuePendingWrite,
+} from "./lib/pending-writes.js";
 import { emitCliTelemetry } from "./lib/telemetry.js";
 import { withCliSpan } from "./lib/tracing.js";
 import { CLI_PACKAGE_VERSION } from "./lib/version.js";
@@ -159,6 +165,25 @@ function assertValidDiffProofMode(mode: string): asserts mode is "advisory" | "s
 
 function queuedMemoryFooter(queueId: string): string {
   return `Memory updated: pending local sync (reason=AUTH_REQUIRED, queue=${queueId})`;
+}
+
+function summarizeAuthState(config: ReturnType<typeof loadConfig>): JsonRecord {
+  const pendingWrites = listPendingWrites({ baseUrl: getRuntimeBaseUrl(config) });
+  const authBlockedWrites = pendingWrites.filter((record) => (
+    /AUTH|LOGIN|UNAUTHORIZED|401/i.test(record.queueReason)
+  ));
+  const authenticated = Boolean(config.accessToken || config.apiKey);
+  return {
+    authenticated,
+    token_source: config.accessToken ? "jwt" : config.apiKey ? "api_key" : null,
+    token_storage: config.tokenStorage || "file",
+    status: authenticated
+      ? authBlockedWrites.length > 0 ? "authenticated_with_pending_auth_replay" : "authenticated"
+      : authBlockedWrites.length > 0 ? "login_required_with_pending_replay" : "login_required",
+    pending_writes: pendingWrites.length,
+    auth_blocked_pending_writes: authBlockedWrites.length,
+    login_required: !authenticated || authBlockedWrites.length > 0,
+  };
 }
 
 function queueMemoryWrite(input: {
@@ -2565,6 +2590,7 @@ async function showConfigCommand(): Promise<void> {
   const hasOverride = Boolean(cfg.baseUrl?.trim());
   const configuredWorkspace = getConfiguredWorkspace(cfg);
   const activeWorkspace = await tryResolveConfiguredWorkspace(cfg);
+  const currentAuthConfig = getRuntimeConfig();
   const response: JsonRecord = {
     config_path: resolved.path,
     config_scope: resolved.scope,
@@ -2573,7 +2599,8 @@ async function showConfigCommand(): Promise<void> {
     default_base_url: DEFAULT_BASE_URL,
     effective_base_url: getRuntimeBaseUrl(cfg),
     auth_profile_key: getRuntimeBaseUrl(cfg),
-    authenticated: Boolean(cfg.accessToken || cfg.apiKey),
+    authenticated: Boolean(currentAuthConfig.accessToken || currentAuthConfig.apiKey),
+    auth_status: summarizeAuthState(currentAuthConfig),
     override_source: hasOverride ? "config.baseUrl" : "default",
     active_workspace: serializeWorkspaceSummary(activeWorkspace.workspace),
     configured_workspace: serializeWorkspaceSummary(configuredWorkspace),
@@ -3890,6 +3917,7 @@ agent
         project_slug: selectedTarget?.projectSlug || null,
       },
     });
+    const currentAuthConfig = getRuntimeConfig();
 
     console.log(JSON.stringify({
       config_path: getConfigPath(),
@@ -3906,7 +3934,8 @@ agent
       workspace_slug: selectedTarget?.workspaceSlug || null,
       project_id: selectedTarget?.projectId || null,
       project_slug: selectedTarget?.projectSlug || null,
-      authenticated: Boolean(cfg.accessToken || cfg.apiKey),
+      authenticated: Boolean(currentAuthConfig.accessToken || currentAuthConfig.apiKey),
+      auth_status: summarizeAuthState(currentAuthConfig),
       codex: {
         skill_dir: codex.skillDir,
         skill_path: codex.skillPath,

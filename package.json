@@ -1,6 +1,6 @@
 {
   "name": "recallstack",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Recallstack CLI",
   "license": "MIT",
   "type": "module",

@@ -1,11 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import {
+  deleteSecureToken,
+  readSecureToken,
+  secureTokenStoreAvailable,
+  writeSecureToken,
+  type SecureTokenName,
+} from "./token-store.js";
 
 export type RecallstackProfile = {
   accessToken?: string;
   refreshToken?: string;
   apiKey?: string;
+  tokenStorage?: "keychain";
   activeWorkspaceId?: string;
   activeWorkspaceSlug?: string;
   activeWorkspaceName?: string;
@@ -59,10 +67,12 @@ function normalizeOptionalToken(value: unknown): string | undefined {
 
 function normalizeProfile(value: unknown): RecallstackProfile {
   const parsed = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const tokenStorage = parsed.tokenStorage === "keychain" ? "keychain" : undefined;
   return {
     accessToken: normalizeOptionalToken(parsed.accessToken),
     refreshToken: normalizeOptionalToken(parsed.refreshToken),
     apiKey: normalizeOptionalToken(parsed.apiKey),
+    tokenStorage,
     activeWorkspaceId: normalizeOptionalToken(parsed.activeWorkspaceId),
     activeWorkspaceSlug: normalizeOptionalToken(parsed.activeWorkspaceSlug),
     activeWorkspaceName: normalizeOptionalToken(parsed.activeWorkspaceName),
@@ -74,6 +84,7 @@ function serializeProfile(profile: RecallstackProfile): Record<string, string | 
     accessToken: normalizeOptionalToken(profile.accessToken),
     refreshToken: normalizeOptionalToken(profile.refreshToken),
     apiKey: normalizeOptionalToken(profile.apiKey),
+    tokenStorage: profile.tokenStorage,
     activeWorkspaceId: normalizeOptionalToken(profile.activeWorkspaceId),
     activeWorkspaceSlug: normalizeOptionalToken(profile.activeWorkspaceSlug),
     activeWorkspaceName: normalizeOptionalToken(profile.activeWorkspaceName),
@@ -141,6 +152,48 @@ function writeGlobalConfigFile(filePath: string, config: GlobalConfigFile): void
   writeConfigFile(filePath, {
     ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
     ...(Object.keys(profiles).length ? { profiles } : {}),
+  });
+}
+
+const TOKEN_NAMES: SecureTokenName[] = ["accessToken", "refreshToken", "apiKey"];
+
+function resolveProfileSecrets(baseUrl: string, profile: RecallstackProfile): RecallstackProfile {
+  if (profile.tokenStorage !== "keychain") return profile;
+  return normalizeProfile({
+    ...profile,
+    accessToken: profile.accessToken || readSecureToken(baseUrl, "accessToken"),
+    refreshToken: profile.refreshToken || readSecureToken(baseUrl, "refreshToken"),
+    apiKey: profile.apiKey || readSecureToken(baseUrl, "apiKey"),
+  });
+}
+
+function persistProfile(baseUrl: string, profile: RecallstackProfile): RecallstackProfile {
+  if (!secureTokenStoreAvailable()) {
+    return normalizeProfile(profile);
+  }
+
+  let persistedSecurely = false;
+  for (const tokenName of TOKEN_NAMES) {
+    const value = profile[tokenName];
+    if (value) {
+      persistedSecurely = writeSecureToken(baseUrl, tokenName, value) || persistedSecurely;
+    } else {
+      deleteSecureToken(baseUrl, tokenName);
+    }
+  }
+
+  if (!persistedSecurely && TOKEN_NAMES.some((tokenName) => Boolean(profile[tokenName]))) {
+    return normalizeProfile(profile);
+  }
+
+  const serialized = serializeProfile(profile);
+  for (const tokenName of TOKEN_NAMES) {
+    delete serialized[tokenName];
+  }
+
+  return normalizeProfile({
+    ...serialized,
+    ...(persistedSecurely ? { tokenStorage: "keychain" } : {}),
   });
 }
 
@@ -222,7 +275,7 @@ export function loadConfig(options: ConfigPathOptions = {}): RecallstackConfig {
   const projectConfig = resolved.scope === "project" ? readProjectConfigFile(resolved.path) : undefined;
   const baseUrl = projectConfig?.baseUrl ?? globalConfig.baseUrl;
   const effectiveBaseUrl = baseUrl || DEFAULT_BASE_URL;
-  const profile = globalConfig.profiles[effectiveBaseUrl] || {};
+  const profile = resolveProfileSecrets(effectiveBaseUrl, globalConfig.profiles[effectiveBaseUrl] || {});
 
   return {
     baseUrl,
@@ -250,19 +303,54 @@ export function saveBaseUrlOverride(baseUrl: string | undefined, options: Config
 export function updateProfileForBaseUrl(baseUrl: string, patch: Partial<RecallstackProfile>): void {
   const targetKey = normalizeOptionalUrl(baseUrl) || DEFAULT_BASE_URL;
   const globalConfig = readGlobalConfigFile(globalConfigPath);
-  const currentProfile = globalConfig.profiles[targetKey] || {};
+  const currentProfile = resolveProfileSecrets(targetKey, globalConfig.profiles[targetKey] || {});
   const nextProfile = normalizeProfile({
     ...currentProfile,
     ...patch,
   });
+  const persistedProfile = persistProfile(targetKey, nextProfile);
 
-  if (isProfileEmpty(nextProfile)) {
+  if (isProfileEmpty(persistedProfile)) {
     delete globalConfig.profiles[targetKey];
   } else {
-    globalConfig.profiles[targetKey] = nextProfile;
+    globalConfig.profiles[targetKey] = persistedProfile;
   }
 
   writeGlobalConfigFile(globalConfigPath, globalConfig);
+}
+
+export function updateProfileForBaseUrlIfCurrent(
+  baseUrl: string,
+  expected: Partial<RecallstackProfile>,
+  patch: Partial<RecallstackProfile>,
+): boolean {
+  const targetKey = normalizeOptionalUrl(baseUrl) || DEFAULT_BASE_URL;
+  const globalConfig = readGlobalConfigFile(globalConfigPath);
+  const currentProfile = resolveProfileSecrets(targetKey, normalizeProfile(globalConfig.profiles[targetKey] || {}));
+  const expectedProfile = serializeProfile(expected);
+  const currentSerialized = serializeProfile(currentProfile);
+
+  for (const [key, value] of Object.entries(expectedProfile)) {
+    if (value === undefined) continue;
+    if (currentSerialized[key as keyof RecallstackProfile] !== value) {
+      return false;
+    }
+  }
+
+  const nextProfile = normalizeProfile({
+    ...currentProfile,
+    ...patch,
+  });
+  const persistedProfile = persistProfile(targetKey, nextProfile);
+
+  if (isProfileEmpty(persistedProfile)) {
+    delete globalConfig.profiles[targetKey];
+  } else {
+    globalConfig.profiles[targetKey] = persistedProfile;
+  }
+
+  writeGlobalConfigFile(globalConfigPath, globalConfig);
+  return true;
 }
 
 export function getConfigPath(options: ConfigPathOptions = {}): string {

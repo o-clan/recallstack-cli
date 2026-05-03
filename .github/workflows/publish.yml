@@ -58,4 +58,4 @@ jobs:
 
       - name: Publish CLI
         if: steps.cli_version.outputs.publish == 'true'
-        run: npm publish --access public
+        run: npm publish --access public --provenance

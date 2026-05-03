@@ -1,4 +1,10 @@
-import { getEffectiveBaseUrl, loadConfig, updateProfileForBaseUrl, type RecallstackConfig } from "./config.js";
+import {
+  getEffectiveBaseUrl,
+  loadConfig,
+  updateProfileForBaseUrl,
+  updateProfileForBaseUrlIfCurrent,
+  type RecallstackConfig,
+} from "./config.js";
 import { HttpError, http } from "./http.js";
 
 export async function loginWithCode(code: string, runtimeConfig?: RecallstackConfig): Promise<void> {
@@ -92,14 +98,69 @@ async function refreshAccessToken(cfg: RecallstackConfig, baseUrl: string): Prom
     return nextConfig;
   } catch (error) {
     if (error instanceof HttpError && error.status === 401) {
-      updateProfileForBaseUrl(baseUrl, {
-        accessToken: undefined,
-        refreshToken: undefined,
-      });
+      const latest = latestConfigForBaseUrl(baseUrl);
+      if (latest && configHasNewerAuth(latest, cfg)) {
+        return latest;
+      }
+      updateProfileForBaseUrlIfCurrent(
+        baseUrl,
+        { refreshToken: cfg.refreshToken },
+        {
+          accessToken: undefined,
+          refreshToken: undefined,
+        },
+      );
       throw new Error("Authentication expired. Run `recallstack login`.");
     }
     throw error;
   }
+}
+
+function latestConfigForBaseUrl(baseUrl: string): RecallstackConfig | undefined {
+  const latest = loadConfig();
+  return getEffectiveBaseUrl(latest) === baseUrl ? latest : undefined;
+}
+
+function configHasNewerAuth(latest: RecallstackConfig, previous: RecallstackConfig): boolean {
+  return Boolean(
+    (latest.accessToken && latest.accessToken !== previous.accessToken)
+    || (latest.refreshToken && latest.refreshToken !== previous.refreshToken),
+  );
+}
+
+async function retryWithFreshAuth<T>(
+  baseUrl: string,
+  previousConfig: RecallstackConfig,
+  path: string,
+  options: { method?: string; body?: unknown; workspaceId?: string },
+): Promise<T | undefined> {
+  const latest = latestConfigForBaseUrl(baseUrl);
+  if (!latest || !configHasNewerAuth(latest, previousConfig)) {
+    return undefined;
+  }
+
+  if (latest.accessToken) {
+    return http<T>(baseUrl, path, {
+      method: options.method,
+      body: options.body,
+      token: latest.accessToken,
+      workspaceId: options.workspaceId,
+    });
+  }
+
+  if (latest.refreshToken) {
+    const refreshed = await refreshAccessToken(latest, baseUrl);
+    if (refreshed.accessToken) {
+      return http<T>(baseUrl, path, {
+        method: options.method,
+        body: options.body,
+        token: refreshed.accessToken,
+        workspaceId: options.workspaceId,
+      });
+    }
+  }
+
+  return undefined;
 }
 
 export async function authenticatedHttp<T>(
@@ -136,6 +197,10 @@ export async function authenticatedHttp<T>(
             workspaceId: options.workspaceId,
           });
         } catch (refreshError) {
+          const retried = await retryWithFreshAuth<T>(baseUrl, cfg, path, options);
+          if (retried !== undefined) {
+            return retried;
+          }
           if (cfg.apiKey) {
             return http<T>(baseUrl, path, {
               method: options.method,
@@ -155,6 +220,11 @@ export async function authenticatedHttp<T>(
           token: cfg.apiKey,
           workspaceId: options.workspaceId,
         });
+      }
+
+      const retried = await retryWithFreshAuth<T>(baseUrl, cfg, path, options);
+      if (retried !== undefined) {
+        return retried;
       }
 
       throw error;
