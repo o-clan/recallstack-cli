@@ -7,7 +7,7 @@ It provides:
 - authentication against the Recallstack API
 - project and workspace targeting
 - memory ingest and retrieval commands
-- agent hook installers for Codex, Claude Code, Cursor, and GitHub Copilot
+- agent hook installers for Codex, Claude Code, Cursor, GitHub Copilot, and Google Antigravity
 
 ## Install
 

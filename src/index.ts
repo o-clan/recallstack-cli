@@ -27,6 +27,8 @@ import { emitCliTelemetry } from "./lib/telemetry.js";
 import { withCliSpan } from "./lib/tracing.js";
 import { CLI_PACKAGE_VERSION } from "./lib/version.js";
 import {
+  ANTIGRAVITY_HOOK_TEMPLATE,
+  ANTIGRAVITY_SKILL_TEMPLATE,
   CLAUDE_HOOK_TEMPLATE,
   CLAUDE_SKILL_TEMPLATE,
   COPILOT_HOOK_TEMPLATE,
@@ -39,10 +41,10 @@ import {
 } from "./lib/agent-templates.js";
 import { closeTurnSnapshot, proofBytes, startTurnSnapshot } from "./mcp/turn-tracker.js";
 
-type AgentTarget = "codex" | "claude" | "cursor" | "copilot" | "all";
+type AgentTarget = "codex" | "claude" | "cursor" | "copilot" | "antigravity" | "all";
 type AgentInstallScope = "local" | "global";
 type JsonRecord = Record<string, unknown>;
-type WorkerModelTarget = Exclude<AgentTarget, "cursor" | "all">;
+type WorkerModelTarget = Exclude<AgentTarget, "cursor" | "antigravity" | "all">;
 type QueryWorkerTarget = WorkerModelTarget;
 type AgentSettings = Partial<Record<WorkerModelTarget, { worker_model?: string }>>;
 type AgentInstallOptions = { workerModel?: string; scope?: AgentInstallScope };
@@ -122,6 +124,12 @@ const CURSOR_HOOKS_FILENAME = "hooks.json";
 const COPILOT_HOOK_FILENAME = "recallstack.mjs";
 const COPILOT_CLI_HOOKS_FILENAME = "recallstack-copilot-cli.json";
 const COPILOT_VSCODE_HOOKS_FILENAME = "recallstack-vscode.json";
+const ANTIGRAVITY_SKILL_NAME = "recallstack-memory";
+const ANTIGRAVITY_HOOK_FILENAME = "recallstack.mjs";
+const ANTIGRAVITY_HOOKS_FILENAME = "hooks.json";
+const ANTIGRAVITY_PLUGIN_NAME = "recallstack";
+const ANTIGRAVITY_CLI_INSTALL_URL = "https://antigravity.google/cli/install.sh";
+const ANTIGRAVITY_CLI_INSTALL_COMMAND = `curl -fsSL ${ANTIGRAVITY_CLI_INSTALL_URL} | bash`;
 const QUERY_SYNTHESIS_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -359,6 +367,50 @@ function resolveCursorIntegrationPaths(cwd: string, scope: AgentInstallScope = "
   };
 }
 
+function resolveAntigravityLocalIntegrationPaths(cwd: string): {
+  root: string;
+  skillDir: string;
+  skillPath: string;
+  hookDir: string;
+  hookPath: string;
+  hooksConfigPath: string;
+} {
+  const root = join(cwd, ".agents");
+  const skillDir = join(root, "skills", ANTIGRAVITY_SKILL_NAME);
+  const hookDir = join(root, "hooks");
+  return {
+    root,
+    skillDir,
+    skillPath: join(skillDir, "SKILL.md"),
+    hookDir,
+    hookPath: join(hookDir, ANTIGRAVITY_HOOK_FILENAME),
+    hooksConfigPath: join(root, ANTIGRAVITY_HOOKS_FILENAME),
+  };
+}
+
+function resolveAntigravityGlobalIntegrationPaths(): {
+  pluginRoot: string;
+  pluginManifestPath: string;
+  skillDir: string;
+  skillPath: string;
+  hookDir: string;
+  hookPath: string;
+  hooksConfigPath: string;
+} {
+  const pluginRoot = join(homedir(), ".gemini", "antigravity-cli", "plugins", ANTIGRAVITY_PLUGIN_NAME);
+  const skillDir = join(pluginRoot, "skills", ANTIGRAVITY_SKILL_NAME);
+  const hookDir = join(pluginRoot, "hooks");
+  return {
+    pluginRoot,
+    pluginManifestPath: join(pluginRoot, "plugin.json"),
+    skillDir,
+    skillPath: join(skillDir, "SKILL.md"),
+    hookDir,
+    hookPath: join(hookDir, ANTIGRAVITY_HOOK_FILENAME),
+    hooksConfigPath: join(pluginRoot, ANTIGRAVITY_HOOKS_FILENAME),
+  };
+}
+
 function getGlobalRecallstackDir(): string {
   return join(homedir(), ".recallstack");
 }
@@ -420,6 +472,42 @@ function workerModelForStatus(cwd: string, scope: AgentInstallScope, target: Wor
     };
   }
   return resolvedWorkerModel(cwd, target);
+}
+
+function workerModelChangeCommand(target: WorkerModelTarget, scope: AgentInstallScope): string {
+  return `recallstack agent model ${target} <model>${scope === "global" ? " --global" : ""}`;
+}
+
+function workerModelClearCommand(target: WorkerModelTarget, scope: AgentInstallScope): string {
+  return `recallstack agent model ${target} --clear${scope === "global" ? " --global" : ""}`;
+}
+
+function assertWorkerModelTarget(value: string): asserts value is WorkerModelTarget {
+  if (value !== "codex" && value !== "claude" && value !== "copilot") {
+    throw new Error('Invalid target. Use "codex", "claude", or "copilot".');
+  }
+}
+
+function workerModelStatusForTarget(cwd: string, scope: AgentInstallScope, target: WorkerModelTarget): JsonRecord {
+  const resolved = workerModelForStatus(cwd, scope, target);
+  return {
+    target,
+    worker_model: resolved.value,
+    worker_model_source: resolved.source,
+    change_command: workerModelChangeCommand(target, scope),
+    clear_command: workerModelClearCommand(target, scope),
+  };
+}
+
+function listWorkerModelStatus(cwd: string, scope: AgentInstallScope): JsonRecord {
+  return {
+    scope,
+    models: {
+      codex: workerModelStatusForTarget(cwd, scope, "codex"),
+      claude: workerModelStatusForTarget(cwd, scope, "claude"),
+      copilot: workerModelStatusForTarget(cwd, scope, "copilot"),
+    },
+  };
 }
 
 function readTextFile(filePath: string): string {
@@ -720,7 +808,7 @@ function targetsForWorkerModel(target: AgentTarget): WorkerModelTarget[] {
   if (target === "all") {
     return ["codex", "claude", "copilot"];
   }
-  if (target === "cursor") {
+  if (target === "cursor" || target === "antigravity") {
     return [];
   }
   return [target];
@@ -798,6 +886,25 @@ function commandAvailable(command: string, versionArg = "--version"): boolean {
     stdio: "ignore",
   });
   return !result.error;
+}
+
+function antigravityCliSynthesisStatus(): JsonRecord {
+  const candidates = ["agy", "antigravity"];
+  const command = candidates.find((candidate) => commandAvailable(candidate, "--help")) || null;
+  const fallbackWorker = commandAvailable("codex", "--help") ? "codex" : "raw_transcript";
+  return {
+    available: Boolean(command),
+    command,
+    candidates,
+    binary: "agy",
+    advisory: command
+      ? "Antigravity CLI is available for native Antigravity synthesis once configured."
+      : "Install Antigravity CLI so Recallstack can use native Antigravity synthesis once configured.",
+    install_url: ANTIGRAVITY_CLI_INSTALL_URL,
+    install_command: ANTIGRAVITY_CLI_INSTALL_COMMAND,
+    installer_kind: "shell_bootstrapper",
+    current_fallback_worker: fallbackWorker,
+  };
 }
 
 function runCommandAsync(command: string, args: string[], options: {
@@ -2055,6 +2162,146 @@ function installCursorIntegration(cwd: string, options: AgentInstallOptions = {}
   };
 }
 
+function ensureAntigravityStopHook(hooksConfig: JsonRecord, command: string): void {
+  const hookName = ANTIGRAVITY_PLUGIN_NAME;
+  const current = typeof hooksConfig[hookName] === "object" && hooksConfig[hookName] !== null
+    ? hooksConfig[hookName] as JsonRecord
+    : {};
+  const existing = Array.isArray(current.Stop) ? current.Stop as unknown[] : [];
+  const hasCommand = existing.some((entry) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    const typedEntry = entry as JsonRecord;
+    if (Array.isArray(typedEntry.hooks)) {
+      return typedEntry.hooks.some((hook) => (
+        typeof hook === "object"
+        && hook !== null
+        && (hook as JsonRecord).type === "command"
+        && (hook as JsonRecord).command === command
+      ));
+    }
+    return typedEntry.type === "command" && typedEntry.command === command;
+  });
+
+  if (!hasCommand) {
+    existing.push({
+      type: "command",
+      command,
+      timeout: 10,
+    });
+  }
+
+  hooksConfig[hookName] = {
+    ...current,
+    enabled: true,
+    Stop: existing,
+  };
+}
+
+function removeAntigravityStopHook(hooksConfig: JsonRecord, command: string): boolean {
+  const hookName = ANTIGRAVITY_PLUGIN_NAME;
+  const current = typeof hooksConfig[hookName] === "object" && hooksConfig[hookName] !== null
+    ? hooksConfig[hookName] as JsonRecord
+    : undefined;
+  if (!current) return false;
+
+  const existing = Array.isArray(current.Stop) ? current.Stop as unknown[] : [];
+  let changed = false;
+  const nextStop = existing.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return [entry];
+    const typedEntry = entry as JsonRecord;
+    if (Array.isArray(typedEntry.hooks)) {
+      const nextHooks = typedEntry.hooks.filter((hook) => {
+        const matches = typeof hook === "object"
+          && hook !== null
+          && (hook as JsonRecord).type === "command"
+          && (hook as JsonRecord).command === command;
+        if (matches) changed = true;
+        return !matches;
+      });
+      if (!nextHooks.length) {
+        changed = true;
+        return [];
+      }
+      return [{ ...typedEntry, hooks: nextHooks }];
+    }
+    const matches = typedEntry.type === "command" && typedEntry.command === command;
+    if (matches) {
+      changed = true;
+      return [];
+    }
+    return [entry];
+  });
+
+  if (!changed) return false;
+
+  if (nextStop.length) {
+    hooksConfig[hookName] = {
+      ...current,
+      Stop: nextStop,
+    };
+  } else {
+    const { Stop: _stop, ...rest } = current;
+    if (Object.keys(rest).length > 0) {
+      hooksConfig[hookName] = rest;
+    } else {
+      delete hooksConfig[hookName];
+    }
+  }
+
+  return true;
+}
+
+function installAntigravityIntegration(cwd: string, options: AgentInstallOptions = {}): JsonRecord {
+  const scope = options.scope || "local";
+  const antigravity = scope === "global"
+    ? resolveAntigravityGlobalIntegrationPaths()
+    : resolveAntigravityLocalIntegrationPaths(cwd);
+  const command = scope === "global"
+    ? `node ${shellQuote(antigravity.hookPath)} stop`
+    : `node ./.agents/hooks/${ANTIGRAVITY_HOOK_FILENAME} stop`;
+
+  writeInstructionFile(antigravity.skillPath, ANTIGRAVITY_SKILL_TEMPLATE);
+  writeExecutableScript(antigravity.hookPath, ANTIGRAVITY_HOOK_TEMPLATE);
+  const hooksConfig = readJsonFile<JsonRecord>(antigravity.hooksConfigPath, {});
+  ensureAntigravityStopHook(hooksConfig, command);
+  writeJsonFile(antigravity.hooksConfigPath, hooksConfig);
+
+  if (scope === "global") {
+    const globalPaths = antigravity as ReturnType<typeof resolveAntigravityGlobalIntegrationPaths>;
+    const synthesis = antigravityCliSynthesisStatus();
+    writeJsonFile(globalPaths.pluginManifestPath, {
+      name: ANTIGRAVITY_PLUGIN_NAME,
+      version: CLI_PACKAGE_VERSION,
+      description: "Recallstack memory retrieval guidance and Antigravity Stop hook automation.",
+      skills: ["skills/"],
+      hooks: "hooks.json",
+    });
+    return {
+      scope,
+      plugin_root: globalPaths.pluginRoot,
+      plugin_manifest_path: globalPaths.pluginManifestPath,
+      skill_path: globalPaths.skillPath,
+      hook_path: globalPaths.hookPath,
+      hooks_config_path: globalPaths.hooksConfigPath,
+      cli_plugin: true,
+      synthesis,
+    };
+  }
+
+  const localPaths = antigravity as ReturnType<typeof resolveAntigravityLocalIntegrationPaths>;
+  return {
+    scope,
+    root: localPaths.root,
+    skill_dir: localPaths.skillDir,
+    skill_path: localPaths.skillPath,
+    hook_dir: localPaths.hookDir,
+    hook_path: localPaths.hookPath,
+    hooks_config_path: localPaths.hooksConfigPath,
+    cli_plugin: false,
+    synthesis: antigravityCliSynthesisStatus(),
+  };
+}
+
 function installCopilotIntegration(cwd: string, options: AgentInstallOptions = {}): JsonRecord {
   const scope = options.scope || "local";
   if (scope === "global") {
@@ -2178,6 +2425,9 @@ function installAgentIntegration(target: AgentTarget, cwd: string, options: Agen
   }
   if (target === "copilot" || target === "all") {
     out.copilot = installCopilotIntegration(cwd, options);
+  }
+  if (target === "antigravity" || target === "all") {
+    out.antigravity = installAntigravityIntegration(cwd, options);
   }
   return out;
 }
@@ -2452,6 +2702,59 @@ function uninstallCursorIntegration(cwd: string, scope: AgentInstallScope = "loc
   };
 }
 
+function uninstallAntigravityIntegration(cwd: string, scope: AgentInstallScope = "local"): JsonRecord {
+  if (scope === "global") {
+    const antigravity = resolveAntigravityGlobalIntegrationPaths();
+    return {
+      scope,
+      plugin_root: antigravity.pluginRoot,
+      plugin_root_removed: removePathIfExists(antigravity.pluginRoot),
+      cli_plugin: true,
+    };
+  }
+
+  const antigravity = resolveAntigravityLocalIntegrationPaths(cwd);
+  const command = `node ./.agents/hooks/${ANTIGRAVITY_HOOK_FILENAME} stop`;
+  const legacyAbsoluteCommand = `node ${shellQuote(antigravity.hookPath)} stop`;
+  const skillRemoved = removePathIfExists(antigravity.skillDir) || removePathIfExists(antigravity.skillPath);
+  const hookRemoved = removePathIfExists(antigravity.hookPath);
+
+  let hooksConfigUpdated = false;
+  let hooksConfigRemoved = false;
+  if (existsSync(antigravity.hooksConfigPath)) {
+    const hooksConfig = readJsonFile<JsonRecord>(antigravity.hooksConfigPath, {});
+    hooksConfigUpdated = removeAntigravityStopHook(hooksConfig, command)
+      || removeAntigravityStopHook(hooksConfig, legacyAbsoluteCommand);
+    if (hooksConfigUpdated) {
+      if (Object.keys(hooksConfig).length === 0) {
+        removePathIfExists(antigravity.hooksConfigPath);
+        hooksConfigRemoved = true;
+      } else {
+        writeJsonFile(antigravity.hooksConfigPath, hooksConfig);
+      }
+    }
+  }
+
+  pruneEmptyDirectories([
+    antigravity.hookDir,
+    dirname(antigravity.skillDir),
+    antigravity.root,
+  ], cwd);
+
+  return {
+    scope,
+    root: antigravity.root,
+    skill_dir: antigravity.skillDir,
+    skill_removed: skillRemoved,
+    hook_path: antigravity.hookPath,
+    hook_removed: hookRemoved,
+    hooks_config_path: antigravity.hooksConfigPath,
+    hooks_config_updated: hooksConfigUpdated,
+    hooks_config_removed: hooksConfigRemoved,
+    cli_plugin: false,
+  };
+}
+
 function uninstallCopilotIntegration(cwd: string, scope: AgentInstallScope = "local"): JsonRecord {
   if (scope === "global") {
     const copilot = resolveCopilotGlobalIntegrationPaths();
@@ -2543,6 +2846,9 @@ function uninstallAgentIntegration(
   }
   if (target === "copilot" || target === "all") {
     out.copilot = uninstallCopilotIntegration(cwd, scope);
+  }
+  if (target === "antigravity" || target === "all") {
+    out.antigravity = uninstallAntigravityIntegration(cwd, scope);
   }
   if (options.purgeProjectState && scope === "local") {
     out.project_state = purgeProjectRecallstackState(cwd);
@@ -3350,6 +3656,8 @@ memory
   .option("--json", "Return the raw JSON retrieval object")
   .option("--verbose", "Include retrieval diagnostics in raw JSON output (requires --json)")
   .option("--turn-id <id>", "Turn identifier to start local tracking snapshot")
+  .option("--synthesize-only", "Show only the synthesized answer without caveats or evidence")
+  .option("--synthesize-with-caveats", "Show synthesized answer and caveats, without evidence")
   .action(async (options) => {
     const startedAt = Date.now();
     const cfg = getRuntimeConfig();
@@ -3374,9 +3682,15 @@ memory
     }
 
     const jsonMode = Boolean(options.json);
-    const synthesizeMode = Boolean(options.synthesize || options.workerModel || options.workerTarget);
+    const synthesizeMode = Boolean(options.synthesize || options.workerModel || options.workerTarget || options.synthesizeOnly || options.synthesizeWithCaveats);
     if (cliHasFlag("--verbose") && !jsonMode) {
       throw new Error("--verbose requires --json.");
+    }
+    if (options.synthesizeOnly && options.synthesizeWithCaveats) {
+      throw new Error("Cannot combine --synthesize-only and --synthesize-with-caveats.");
+    }
+    if (jsonMode && (options.synthesizeOnly || options.synthesizeWithCaveats)) {
+      throw new Error("Cannot combine --json with synthesis display filters.");
     }
     const showLiveStatus = !jsonMode && process.stderr.isTTY;
     let spinner: { stop: () => void } | null = null;
@@ -3446,20 +3760,37 @@ memory
         const payload = synthesized ? { ...out, synthesis: synthesized } : out;
         console.log(JSON.stringify(payload, null, 2));
       } else if (synthesized) {
-        const lines = [
-          "SYNTHESIS",
-          synthesized.answer,
-        ];
-        if (synthesized.caveats.length) {
-          lines.push("");
-          lines.push("CAVEATS");
-          for (const caveat of synthesized.caveats) {
-            lines.push(`- ${caveat}`);
+        if (options.synthesizeOnly) {
+          console.log(synthesized.answer);
+        } else if (options.synthesizeWithCaveats) {
+          const lines = [
+            "SYNTHESIS",
+            synthesized.answer,
+          ];
+          if (synthesized.caveats.length) {
+            lines.push("");
+            lines.push("CAVEATS");
+            for (const caveat of synthesized.caveats) {
+              lines.push(`- ${caveat}`);
+            }
           }
+          console.log(formatStructuredQueryForCli(lines.join("\n")));
+        } else {
+          const lines = [
+            "SYNTHESIS",
+            synthesized.answer,
+          ];
+          if (synthesized.caveats.length) {
+            lines.push("");
+            lines.push("CAVEATS");
+            for (const caveat of synthesized.caveats) {
+              lines.push(`- ${caveat}`);
+            }
+          }
+          lines.push("");
+          lines.push(formatMemoryRetrieveForCli(out));
+          console.log(formatStructuredQueryForCli(lines.join("\n")));
         }
-        lines.push("");
-        lines.push(formatMemoryRetrieveForCli(out));
-        console.log(formatStructuredQueryForCli(lines.join("\n")));
       } else if (typeof out?.structured === "string") {
         console.log(formatStructuredQueryForCli(out.structured));
       } else {
@@ -3720,9 +4051,60 @@ memorySource
 const agent = program.command("agent").description("Install and inspect agent memory integrations");
 
 agent
+  .command("model")
+  .description("Show, set, or clear synthesis worker models for agent integrations")
+  .argument("[target]", "codex|claude|copilot")
+  .argument("[model]", "Model to use for synthesis and background worker runs")
+  .option("--cwd <cwd>", "Target workspace", process.cwd())
+  .option("--global", "Use user-level model settings instead of this repo")
+  .option("--clear", "Clear the configured model for the target")
+  .action((targetArg: string | undefined, modelArg: string | undefined, options: { cwd: string; global?: boolean; clear?: boolean }) => {
+    const scope: AgentInstallScope = options.global ? "global" : "local";
+    if (!targetArg) {
+      if (modelArg || options.clear) {
+        throw new Error("Choose a target before setting or clearing a model.");
+      }
+      console.log(JSON.stringify(listWorkerModelStatus(options.cwd, scope), null, 2));
+      return;
+    }
+
+    assertWorkerModelTarget(targetArg);
+    if (options.clear && modelArg) {
+      throw new Error("Provide either a model or --clear, not both.");
+    }
+
+    if (options.clear) {
+      const cleared = clearWorkerModelSetting(options.cwd, targetArg, scope);
+      console.log(JSON.stringify({
+        scope,
+        target: targetArg,
+        cleared: Boolean(cleared),
+        agent_settings_path: cleared?.path || getAgentSettingsPath(options.cwd, scope),
+        model: workerModelStatusForTarget(options.cwd, scope, targetArg),
+      }, null, 2));
+      return;
+    }
+
+    const normalizedModel = normalizeValue(modelArg);
+    if (!normalizedModel) {
+      console.log(JSON.stringify(workerModelStatusForTarget(options.cwd, scope, targetArg), null, 2));
+      return;
+    }
+
+    const applied = applyWorkerModelSetting(options.cwd, targetArg, normalizedModel, scope);
+    console.log(JSON.stringify({
+      scope,
+      target: targetArg,
+      worker_model: normalizedModel,
+      agent_settings_path: applied.path || getAgentSettingsPath(options.cwd, scope),
+      model: workerModelStatusForTarget(options.cwd, scope, targetArg),
+    }, null, 2));
+  });
+
+agent
   .command("install")
-  .description("Install Recallstack hooks/rules for codex, claude, cursor, copilot, or all")
-  .argument("<target>", "supported targets: codex|claude|cursor|copilot|all")
+  .description("Install Recallstack hooks/rules for codex, claude, cursor, copilot, antigravity, or all")
+  .argument("<target>", "supported targets: codex|claude|cursor|copilot|antigravity|all")
   .option("--cwd <cwd>", "Target workspace", process.cwd())
   .option("--project <project>", "Workspace default project projectSlug or workspaceSlug/projectSlug")
   .option("--global", "Install into user-level agent config instead of this repo")
@@ -3732,8 +4114,8 @@ agent
     const startedAt = Date.now();
     const normalized = targetName as AgentTarget;
     const scope: AgentInstallScope = options.global ? "global" : "local";
-    if (!["codex", "claude", "cursor", "copilot", "all"].includes(normalized)) {
-      throw new Error(`Unsupported target "${targetName}". Use codex, claude, cursor, copilot, or all.`);
+    if (!["codex", "claude", "cursor", "copilot", "antigravity", "all"].includes(normalized)) {
+      throw new Error(`Unsupported target "${targetName}". Use codex, claude, cursor, copilot, antigravity, or all.`);
     }
     if (scope === "global" && options.project) {
       throw new Error("`--project` cannot be used with `agent install --global`. Configure repo targets separately with `recallstack project use`.");
@@ -3825,8 +4207,8 @@ agent
 
 agent
   .command("uninstall")
-  .description("Remove Recallstack hooks/rules for codex, claude, cursor, copilot, or all")
-  .argument("<target>", "codex|claude|cursor|copilot|all")
+  .description("Remove Recallstack hooks/rules for codex, claude, cursor, copilot, antigravity, or all")
+  .argument("<target>", "codex|claude|cursor|copilot|antigravity|all")
   .option("--cwd <cwd>", "Target workspace", process.cwd())
   .option("--global", "Remove the user-level installation instead of this repo installation")
   .option("--purge-project-state", "Also remove .recallstack project state for this workspace")
@@ -3835,8 +4217,8 @@ agent
     const cfg = getRuntimeConfig();
     const normalized = target as AgentTarget;
     const scope: AgentInstallScope = (options as { global?: boolean }).global ? "global" : "local";
-    if (!["codex", "claude", "cursor", "copilot", "all"].includes(normalized)) {
-      throw new Error('Invalid target. Use "codex", "claude", "cursor", "copilot", or "all".');
+    if (!["codex", "claude", "cursor", "copilot", "antigravity", "all"].includes(normalized)) {
+      throw new Error('Invalid target. Use "codex", "claude", "cursor", "copilot", "antigravity", or "all".');
     }
     if (scope === "global" && options.purgeProjectState) {
       throw new Error("`--purge-project-state` is only valid for local uninstall.");
@@ -3901,6 +4283,8 @@ agent
     const cursor = resolveCursorIntegrationPaths(options.cwd, scope);
     const copilotLocal = resolveCopilotLocalIntegrationPaths(options.cwd);
     const copilotGlobal = resolveCopilotGlobalIntegrationPaths();
+    const antigravityLocal = resolveAntigravityLocalIntegrationPaths(options.cwd);
+    const antigravityGlobal = resolveAntigravityGlobalIntegrationPaths();
     const agentSettingsPath = getAgentSettingsPath(options.cwd, scope);
     const localAgentSettings = readAgentSettings(options.cwd, "local");
     const globalAgentSettings = readAgentSettings(options.cwd, "global");
@@ -3951,6 +4335,8 @@ agent
         repo_hooks_feature_enabled: tomlKeyEnabled(codexConfigText, "features", "codex_hooks", "true"),
         worker_model: workerModelForStatus(options.cwd, scope, "codex").value,
         worker_model_source: workerModelForStatus(options.cwd, scope, "codex").source,
+        worker_model_change_command: workerModelChangeCommand("codex", scope),
+        worker_model_clear_command: workerModelClearCommand("codex", scope),
       },
       claude: {
         hook_path: claude.hookPath,
@@ -3961,6 +4347,8 @@ agent
         skill_installed: existsSync(claude.skillPath),
         worker_model: workerModelForStatus(options.cwd, scope, "claude").value,
         worker_model_source: workerModelForStatus(options.cwd, scope, "claude").source,
+        worker_model_change_command: workerModelChangeCommand("claude", scope),
+        worker_model_clear_command: workerModelClearCommand("claude", scope),
       },
       cursor: {
         rule_path: cursor.rulePath,
@@ -4003,6 +4391,42 @@ agent
         vscode_supported: true,
         worker_model: workerModelForStatus(options.cwd, scope, "copilot").value,
         worker_model_source: workerModelForStatus(options.cwd, scope, "copilot").source,
+        worker_model_change_command: workerModelChangeCommand("copilot", scope),
+        worker_model_clear_command: workerModelClearCommand("copilot", scope),
+      },
+      antigravity: {
+        ...(scope === "global"
+          ? {
+            plugin_root: antigravityGlobal.pluginRoot,
+            plugin_root_present: existsSync(antigravityGlobal.pluginRoot),
+            plugin_manifest_path: antigravityGlobal.pluginManifestPath,
+            plugin_manifest_present: existsSync(antigravityGlobal.pluginManifestPath),
+            skill_path: antigravityGlobal.skillPath,
+            skill_installed: existsSync(antigravityGlobal.skillPath),
+            hook_path: antigravityGlobal.hookPath,
+            hook_installed: existsSync(antigravityGlobal.hookPath),
+            hooks_config_path: antigravityGlobal.hooksConfigPath,
+            hooks_config_present: existsSync(antigravityGlobal.hooksConfigPath),
+            cli_plugin: true,
+          }
+          : {
+            root: antigravityLocal.root,
+            root_present: existsSync(antigravityLocal.root),
+            skill_dir: antigravityLocal.skillDir,
+            skill_path: antigravityLocal.skillPath,
+            skill_installed: existsSync(antigravityLocal.skillPath),
+            hook_dir: antigravityLocal.hookDir,
+            hook_path: antigravityLocal.hookPath,
+            hook_installed: existsSync(antigravityLocal.hookPath),
+            hooks_config_path: antigravityLocal.hooksConfigPath,
+            hooks_config_present: existsSync(antigravityLocal.hooksConfigPath),
+            cli_plugin: false,
+          }),
+        cli_supported: true,
+        ide_supported: true,
+        synthesis: antigravityCliSynthesisStatus(),
+        worker_model: null,
+        worker_model_source: null,
       },
       worker_models: {
         local: localAgentSettings,

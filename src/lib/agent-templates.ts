@@ -3889,3 +3889,768 @@ description: Use Recallstack only for prior decisions, non-local history, recurr
 ---
 
 ${COPILOT_MEMORY_GUIDANCE}`;
+
+export const ANTIGRAVITY_HOOK_TEMPLATE = `#!/usr/bin/env node
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+
+const RECALLSTACK_BIN = process.env.RECALLSTACK_BIN || "recallstack";
+const CODEX_BIN = process.env.CODEX_BIN || "codex";
+const EXTRACT_SCHEMA = {
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    turn_kind: { type: "string", enum: ["substantial", "thin", "pleasantry"] },
+    user_intent: { type: "string" },
+    agent_intent: { type: "string" },
+    key_actions: { type: "array", items: { type: "string" } },
+    tradeoffs: { type: "array", items: { type: "string" } },
+    outcome: { type: "string" },
+    open_questions: { type: "array", items: { type: "string" } }
+  },
+  required: [
+    "turn_kind",
+    "user_intent",
+    "agent_intent",
+    "key_actions",
+    "tradeoffs",
+    "outcome",
+    "open_questions"
+  ]
+};
+
+function ensureDir(dirPath) {
+  mkdirSync(dirPath, { recursive: true });
+}
+
+function readJsonFromString(raw, fallback) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function readJsonFile(filePath, fallback) {
+  if (!existsSync(filePath)) return fallback;
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  ensureDir(dirname(filePath));
+  writeFileSync(filePath, JSON.stringify(value, null, 2) + "\\n", "utf8");
+}
+
+function appendLog(stateDir, fileName, entry) {
+  ensureDir(stateDir);
+  appendFileSync(join(stateDir, fileName), JSON.stringify({
+    timestamp: new Date().toISOString(),
+    ...entry,
+  }) + "\\n", "utf8");
+}
+
+function appendError(stateDir, message, extra) {
+  appendLog(stateDir, "errors.log", { message, extra: extra || null });
+}
+
+function appendEvent(stateDir, event, extra) {
+  appendLog(stateDir, "events.log", { event, extra: extra || null });
+}
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let out = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      out += chunk;
+    });
+    process.stdin.on("end", () => resolve(out));
+  });
+}
+
+function truncate(value, limit) {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim();
+  if (normalized.length <= limit) return normalized;
+  return normalized.slice(0, limit - 3) + "...";
+}
+
+function run(command, args, options) {
+  return spawnSync(command, args, {
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    ...options,
+  });
+}
+
+function resolveCwd(payload) {
+  if (Array.isArray(payload.workspacePaths)) {
+    const first = payload.workspacePaths.find((item) => typeof item === "string" && item.trim().length);
+    if (first) return first;
+  }
+  if (typeof payload.cwd === "string" && payload.cwd.trim().length) {
+    return payload.cwd.trim();
+  }
+  return process.cwd();
+}
+
+function stateDirForCwd(cwd) {
+  return join(cwd, ".recallstack", "antigravity-hooks");
+}
+
+function sessionStatePath(stateDir, payload) {
+  const sessionKey = typeof payload.conversationId === "string" && payload.conversationId.length
+    ? payload.conversationId
+    : createHash("sha1").update(String(payload.transcriptPath || "unknown")).digest("hex");
+  return join(stateDir, "sessions", sessionKey + ".json");
+}
+
+function readTranscriptEntries(transcriptPath) {
+  if (typeof transcriptPath !== "string" || !transcriptPath.length || !existsSync(transcriptPath)) {
+    return [];
+  }
+  const raw = readFileSync(transcriptPath, "utf8");
+  return raw
+    .split(/\\r?\\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      const parsed = readJsonFromString(line, null);
+      return parsed ? [parsed] : [];
+    });
+}
+
+function compactText(value) {
+  return typeof value === "string" ? value.replace(/\\s+/g, " ").trim() : "";
+}
+
+function textFromValue(value, depth = 0) {
+  if (depth > 6 || value == null) return "";
+  if (typeof value === "string") return compactText(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => textFromValue(item, depth + 1)).filter(Boolean).join("\\n").trim();
+  }
+  if (typeof value !== "object") return "";
+
+  const preferred = [];
+  for (const key of ["text", "content", "message", "parts", "result", "response", "output", "input", "prompt"]) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      const text = textFromValue(value[key], depth + 1);
+      if (text.length) preferred.push(text);
+    }
+  }
+  if (preferred.length) return preferred.join("\\n").trim();
+
+  return Object.values(value)
+    .map((item) => textFromValue(item, depth + 1))
+    .filter(Boolean)
+    .join("\\n")
+    .trim();
+}
+
+function roleFromEntry(entry) {
+  const roleCandidates = [
+    entry?.role,
+    entry?.type,
+    entry?.author?.role,
+    entry?.message?.role,
+    entry?.sender,
+    entry?.source,
+  ].filter((value) => typeof value === "string").join(" ").toLowerCase();
+
+  if (/\\b(user|human)\\b/.test(roleCandidates)) return "user";
+  if (/\\b(assistant|agent|model)\\b/.test(roleCandidates)) return "assistant";
+  return "";
+}
+
+function normalizeUserMessage(value) {
+  const text = compactText(value);
+  const requestMatch = text.match(/<USER_REQUEST>\\s*([\\s\\S]*?)\\s*<\\/USER_REQUEST>/i);
+  if (requestMatch?.[1]) {
+    return compactText(requestMatch[1]);
+  }
+  return text.replace(/<ADDITIONAL_METADATA>[\\s\\S]*$/i, "").trim();
+}
+
+function entryStepIndex(entry, fallback) {
+  return typeof entry?.step_index === "number" && Number.isFinite(entry.step_index)
+    ? entry.step_index
+    : fallback;
+}
+
+function isUserEntry(entry) {
+  return roleFromEntry(entry) === "user" || entry?.source === "USER_EXPLICIT" || entry?.type === "USER_INPUT";
+}
+
+function assistantTextFromEntry(entry) {
+  if (entry?.source === "MODEL" && entry?.type === "PLANNER_RESPONSE" && typeof entry?.content === "string") {
+    return compactText(entry.content);
+  }
+  if (roleFromEntry(entry) === "assistant") {
+    return textFromValue(entry);
+  }
+  return "";
+}
+
+function buildTurnsFromTranscript(payload, sessionState) {
+  const transcriptPath = typeof payload.transcriptPath === "string" ? payload.transcriptPath : "";
+  const entries = readTranscriptEntries(transcriptPath);
+  const lastIngestedStepIndex = typeof sessionState?.last_ingested_step_index === "number"
+    ? sessionState.last_ingested_step_index
+    : -1;
+  const turns = [];
+  let current = null;
+
+  function flushCurrent() {
+    if (!current || !current.user_intent || !current.outcome) return;
+    const dedupeKey = createHash("sha1")
+      .update([
+        payload.conversationId || "",
+        transcriptPath,
+        String(current.user_step_index),
+        String(current.assistant_step_index),
+        current.user_intent,
+        current.outcome,
+      ].join("\\n"))
+      .digest("hex");
+    turns.push({
+      ...current,
+      transcript_path: transcriptPath,
+      dedupe_key: dedupeKey,
+    });
+  }
+
+  entries.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object") return;
+    const stepIndex = entryStepIndex(entry, index);
+    if (stepIndex <= lastIngestedStepIndex) return;
+
+    if (isUserEntry(entry)) {
+      flushCurrent();
+      const explicitUser = textFromValue(entry.userMessage || entry.user_message || entry.prompt || entry.input || entry.content || "");
+      const userText = truncate(normalizeUserMessage(explicitUser || textFromValue(entry)), 1000);
+      current = userText.length
+        ? {
+          user_intent: userText,
+          outcome: "",
+          user_step_index: stepIndex,
+          assistant_step_index: stepIndex,
+        }
+        : null;
+      return;
+    }
+
+    const assistantText = truncate(assistantTextFromEntry(entry), 1400);
+    if (current && assistantText.length) {
+      current.outcome = assistantText;
+      current.assistant_step_index = stepIndex;
+    }
+  });
+
+  flushCurrent();
+  return turns;
+}
+
+function transcriptFingerprint(transcriptPath) {
+  try {
+    const stat = statSync(transcriptPath);
+    return String(stat.size) + ":" + String(stat.mtimeMs);
+  } catch {
+    return "";
+  }
+}
+
+function resolveProjectTarget(cwd, stateDir) {
+  const result = run(RECALLSTACK_BIN, ["project", "--cwd", cwd], { cwd });
+  if (result.status !== 0) {
+    appendError(stateDir, "Failed to resolve Recallstack target.", {
+      stdout: truncate(result.stdout || "", 800),
+      stderr: truncate(result.stderr || "", 800),
+    });
+    return null;
+  }
+
+  const parsed = readJsonFromString(result.stdout, null);
+  if (!parsed || typeof parsed.target !== "string" || !parsed.target.length || parsed.project_slug === "global") {
+    return null;
+  }
+  return parsed;
+}
+
+function resolveWorkerModel(cwd) {
+  const envModel = typeof process.env.RECALLSTACK_ANTIGRAVITY_WORKER_MODEL === "string"
+    ? process.env.RECALLSTACK_ANTIGRAVITY_WORKER_MODEL.trim()
+    : typeof process.env.RECALLSTACK_CODEX_WORKER_MODEL === "string"
+      ? process.env.RECALLSTACK_CODEX_WORKER_MODEL.trim()
+      : typeof process.env.RECALLSTACK_WORKER_MODEL === "string"
+        ? process.env.RECALLSTACK_WORKER_MODEL.trim()
+        : "";
+  if (envModel.length) {
+    return envModel;
+  }
+
+  const settings = readJsonFile(join(cwd, ".recallstack", "agent-settings.json"), {});
+  const configured = settings && typeof settings === "object" && settings.codex && typeof settings.codex === "object"
+    ? settings.codex.worker_model
+    : "";
+  if (typeof configured === "string" && configured.trim().length) {
+    return configured.trim();
+  }
+
+  const globalSettings = readJsonFile(join(homedir(), ".recallstack", "agent-settings.json"), {});
+  const globalConfigured = globalSettings && typeof globalSettings === "object" && globalSettings.codex && typeof globalSettings.codex === "object"
+    ? globalSettings.codex.worker_model
+    : "";
+  return typeof globalConfigured === "string" ? globalConfigured.trim() : "";
+}
+
+function compactList(values) {
+  return Array.isArray(values)
+    ? values.map((value) => (typeof value === "string" ? value.trim() : "")).filter(Boolean)
+    : [];
+}
+
+function directUserIntent(turnPayload) {
+  const values = compactList(turnPayload && turnPayload.user_messages);
+  if (!values.length) {
+    return "";
+  }
+  return compactText(values[values.length - 1]);
+}
+
+function directAssistantOutcome(turnPayload) {
+  const values = compactList(turnPayload && turnPayload.assistant_messages);
+  if (values.length) {
+    return compactText(values[values.length - 1]);
+  }
+  return compactText(turnPayload && turnPayload.last_assistant_message);
+}
+
+function isPleasantryOnlyTurn(turnPayload) {
+  const latestUserMessage = directUserIntent(turnPayload);
+  if (!latestUserMessage.length) {
+    return false;
+  }
+  return /^(thanks|thank you|thx|got it(?:,? thanks)?|okay,? thanks|ok,? thanks|cool,? thanks|nice,? thanks|appreciate it|sounds good,? thanks|perfect,? thanks)[!. ]*$/i.test(latestUserMessage);
+}
+
+function fallbackExtractedTurn(turnPayload) {
+  const userIntent = directUserIntent(turnPayload);
+  const outcome = directAssistantOutcome(turnPayload);
+  return {
+    turn_kind: isPleasantryOnlyTurn(turnPayload) ? "pleasantry" : "thin",
+    user_intent: userIntent,
+    agent_intent: outcome.length ? "Respond to the user's latest request and move the work forward." : "",
+    key_actions: [],
+    tradeoffs: [],
+    outcome,
+    open_questions: [],
+  };
+}
+
+function normalizeExtractedTurn(extracted, turnPayload) {
+  if (!extracted || typeof extracted !== "object") {
+    return fallbackExtractedTurn(turnPayload);
+  }
+  const sourceUserMessage = directUserIntent(turnPayload);
+  const extractedKind = typeof extracted.turn_kind === "string" ? extracted.turn_kind.trim() : "";
+  const normalizedKind = extractedKind === "substantial" || extractedKind === "thin" || extractedKind === "pleasantry"
+    ? extractedKind
+    : fallbackExtractedTurn(turnPayload).turn_kind;
+  const turnKind = isPleasantryOnlyTurn(turnPayload) ? "pleasantry" : normalizedKind === "pleasantry" ? "thin" : normalizedKind;
+  return {
+    ...extracted,
+    turn_kind: turnKind,
+    user_intent:
+      (() => {
+        const extractedIntent = compactText(extracted.user_intent);
+        if (!sourceUserMessage.length) {
+          return extractedIntent;
+        }
+        if (extractedIntent.length && !/(capture a recallstack memory|provided codex turn payload|provided claude code turn payload|provided github copilot turn payload|provided antigravity turn payload|extraction task|hook task|json task|recallstack ingestion task)/i.test(extractedIntent)) {
+          return extractedIntent;
+        }
+        return sourceUserMessage;
+      })(),
+    agent_intent: compactText(extracted.agent_intent),
+    outcome: compactText(extracted.outcome) || directAssistantOutcome(turnPayload),
+  };
+}
+
+function buildExtractorPrompt(turnPayload) {
+  return [
+    "You are extracting Recallstack turn memory from a completed Google Antigravity turn.",
+    "Return JSON matching the schema exactly.",
+    "Use only the provided turn payload.",
+    "The source of truth for user_intent is the latest real user message in turnPayload.user_messages.",
+    "If the latest user message is referential or underspecified, use turnPayload.previous_turn_snapshot only to clarify the intent.",
+    "Use at most that one-turn lookback. Do not reconstruct deeper history into user_intent.",
+    "Rewrite that message for clarity only. Preserve its meaning, even if the user message is vague or has typos.",
+    "Do not describe the extraction task, hook task, JSON task, or Recallstack ingestion task as user_intent.",
+    "Capture the project-relevant facts that should be remembered later:",
+    "- what the user wanted",
+    "- what the agent set out to do",
+    "- meaningful actions taken",
+    "- tradeoffs or alternatives discussed",
+    "- the current outcome or best answer",
+    "- open questions or next steps when relevant",
+    "Avoid raw terminal noise, ids, timestamps, file URLs, and low-value housekeeping.",
+    "Classify the turn with turn_kind:",
+    "- substantial: concrete implementation, decisions, verification, meaningful research, or high-signal project progress",
+    "- thin: short but still meaningful steering or confirmation, such as approval to proceed or a brief clarification that changes direction",
+    "- pleasantry: pure courtesy/closure like thank you, noted, or you're welcome with no project signal",
+    "",
+    "TURN PAYLOAD",
+    JSON.stringify(turnPayload, null, 2),
+  ].join("\\n");
+}
+
+function runExtractor(turnPayload, cwd, stateDir) {
+  const workDir = mkdtempSync(join(tmpdir(), "recallstack-antigravity-hook-"));
+  const schemaPath = join(workDir, "schema.json");
+  const outputPath = join(workDir, "output.json");
+  writeJsonFile(schemaPath, EXTRACT_SCHEMA);
+  const workerModel = resolveWorkerModel(cwd);
+  const args = [
+    "exec",
+    "--ephemeral",
+    "--disable",
+    "codex_hooks",
+    "--skip-git-repo-check",
+    "-C",
+    workDir,
+    "--output-schema",
+    schemaPath,
+    "--output-last-message",
+    outputPath,
+    "-",
+  ];
+  if (workerModel.length) {
+    args.splice(1, 0, "--model", workerModel);
+  }
+
+  const result = run(
+    CODEX_BIN,
+    args,
+    {
+      cwd: workDir,
+      input: buildExtractorPrompt(turnPayload),
+      env: {
+        ...process.env,
+        RECALLSTACK_HOOK_ACTIVE: "1",
+      },
+    },
+  );
+
+  try {
+    if (result.status !== 0 || !existsSync(outputPath)) {
+      appendError(stateDir, "Antigravity extractor failed.", {
+        status: result.status,
+        stdout: truncate(result.stdout || "", 1200),
+        stderr: truncate(result.stderr || "", 1200),
+        cwd,
+      });
+      return fallbackExtractedTurn(turnPayload);
+    }
+    return normalizeExtractedTurn(readJsonFile(outputPath, null), turnPayload);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+function buildTurnSnapshot(extracted, summary) {
+  return {
+    turn_kind: typeof extracted.turn_kind === "string" ? extracted.turn_kind : "thin",
+    user_intent: compactText(extracted.user_intent),
+    agent_intent: compactText(extracted.agent_intent),
+    outcome: compactText(extracted.outcome),
+    summary: compactText(summary),
+  };
+}
+
+function formatSummary(extracted, turnPayload) {
+  const lines = [];
+  const turnKind = typeof extracted.turn_kind === "string" ? extracted.turn_kind : "thin";
+  if (typeof extracted.user_intent === "string" && extracted.user_intent.trim().length) {
+    lines.push("User intent: " + extracted.user_intent.trim());
+  }
+  if (turnKind === "substantial" && typeof extracted.agent_intent === "string" && extracted.agent_intent.trim().length) {
+    lines.push("Agent intent: " + extracted.agent_intent.trim());
+  }
+  const keyActions = compactList(extracted.key_actions);
+  if (turnKind === "substantial" && keyActions.length) {
+    lines.push("Actions: " + keyActions.join("; "));
+  }
+  const tradeoffs = compactList(extracted.tradeoffs);
+  if (turnKind === "substantial" && tradeoffs.length) {
+    lines.push("Tradeoffs: " + tradeoffs.join("; "));
+  }
+  if (typeof extracted.outcome === "string" && extracted.outcome.trim().length) {
+    lines.push("Outcome: " + extracted.outcome.trim());
+  }
+  const openQuestions = compactList(extracted.open_questions);
+  if (turnKind === "substantial" && openQuestions.length) {
+    lines.push("Open questions: " + openQuestions.join("; "));
+  }
+  if (lines.length) {
+    return lines.join("\\n").trim();
+  }
+  const fallback = fallbackExtractedTurn(turnPayload);
+  if (fallback.user_intent.length) {
+    lines.push("User intent: " + fallback.user_intent);
+  }
+  if (fallback.outcome.length) {
+    lines.push("Outcome: " + fallback.outcome);
+  }
+  return lines.join("\\n").trim();
+}
+
+function ingestMemory(cwd, target, summary, idempotencyKey, metadata) {
+  return run(
+    RECALLSTACK_BIN,
+    [
+      "memory",
+      "ingest",
+      "--project",
+      target,
+      "--stdin",
+      "--idempotency-key",
+      idempotencyKey,
+      "--metadata",
+      JSON.stringify(metadata),
+    ],
+    {
+      cwd,
+      input: summary,
+    },
+  );
+}
+
+function spawnDetachedWorker(jobPath, cwd, stateDir) {
+  const child = spawn(process.execPath, [process.argv[1], "--worker", jobPath], {
+    cwd,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      RECALLSTACK_HOOK_ACTIVE: "1",
+    },
+  });
+  child.unref();
+  appendEvent(stateDir, "job_spawned", {
+    job_path: jobPath,
+    pid: child.pid,
+  });
+}
+
+function enqueueStopJob(payload) {
+  const cwd = resolveCwd(payload);
+  const stateDir = stateDirForCwd(cwd);
+  const jobsDir = join(stateDir, "jobs");
+  ensureDir(jobsDir);
+  const jobPath = join(jobsDir, createHash("sha1").update(String(payload.conversationId || randomUUID()) + ":" + String(Date.now())).digest("hex") + ".json");
+  writeJsonFile(jobPath, {
+    cwd,
+    raw_payload: payload,
+  });
+  spawnDetachedWorker(jobPath, cwd, stateDir);
+}
+
+function runWorker(jobPath) {
+  const job = readJsonFromString(readFileSync(jobPath, "utf8"), null);
+  if (!job || typeof job !== "object") return;
+
+  const cwd = typeof job.cwd === "string" && job.cwd.length ? job.cwd : process.cwd();
+  const stateDir = stateDirForCwd(cwd);
+  ensureDir(stateDir);
+
+  const payload = job.raw_payload && typeof job.raw_payload === "object" ? job.raw_payload : {};
+  const statePath = sessionStatePath(stateDir, payload);
+  const sessionState = readJsonFile(statePath, {});
+  const project = resolveProjectTarget(cwd, stateDir);
+  if (!project) {
+    appendEvent(stateDir, "project_target_missing", { job_path: jobPath });
+    return;
+  }
+
+  const turns = buildTurnsFromTranscript(payload, sessionState);
+  if (!turns.length) {
+    appendEvent(stateDir, "turn_skipped", { job_path: jobPath, reason: "no_new_turns" });
+    rmSync(jobPath, { force: true });
+    return;
+  }
+
+  let processedCount = 0;
+  let skippedCount = 0;
+  let previousTurnSnapshot = sessionState.last_turn_snapshot || null;
+  let lastProcessedStepIndex = typeof sessionState.last_ingested_step_index === "number"
+    ? sessionState.last_ingested_step_index
+    : -1;
+
+  for (const turn of turns) {
+    const turnPayload = {
+      ...turn,
+      user_messages: [turn.user_intent].filter(Boolean),
+      assistant_messages: [turn.outcome].filter(Boolean),
+      last_assistant_message: turn.outcome || null,
+      previous_turn_snapshot: previousTurnSnapshot,
+    };
+    const extracted = runExtractor(turnPayload, cwd, stateDir);
+    if (extracted.turn_kind === "pleasantry") {
+      skippedCount += 1;
+      lastProcessedStepIndex = Math.max(lastProcessedStepIndex, turn.assistant_step_index || turn.user_step_index || -1);
+      continue;
+    }
+
+    const summary = formatSummary(extracted, turnPayload);
+    if (!summary.length) {
+      skippedCount += 1;
+      lastProcessedStepIndex = Math.max(lastProcessedStepIndex, turn.assistant_step_index || turn.user_step_index || -1);
+      continue;
+    }
+
+    const idempotencyKey = "antigravity-hook-" + createHash("sha1").update(cwd + ":" + turn.dedupe_key).digest("hex");
+    const ingest = ingestMemory(cwd, project.target, summary, idempotencyKey, {
+      agent: "google_antigravity",
+      source: "antigravity_stop_hook",
+      extractor: "codex_json_schema_worker",
+      turn_kind: extracted.turn_kind || null,
+      user_intent: extracted.user_intent || null,
+      agent_intent: extracted.agent_intent || null,
+      key_actions: compactList(extracted.key_actions),
+      tradeoffs: compactList(extracted.tradeoffs),
+      open_questions: compactList(extracted.open_questions),
+      conversation_id: typeof payload.conversationId === "string" ? payload.conversationId : null,
+      transcript_path: turn.transcript_path || null,
+      user_step_index: turn.user_step_index || null,
+      assistant_step_index: turn.assistant_step_index || null,
+      termination_reason: typeof payload.terminationReason === "string" ? payload.terminationReason : null,
+      fully_idle: typeof payload.fullyIdle === "boolean" ? payload.fullyIdle : null,
+      workspace_paths: Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [],
+    });
+
+    if (ingest.status !== 0) {
+      appendError(stateDir, "Recallstack ingest failed from Antigravity hook.", {
+        status: ingest.status,
+        stdout: truncate(ingest.stdout || "", 1200),
+        stderr: truncate(ingest.stderr || "", 1200),
+        target: project.target,
+        job_path: jobPath,
+        user_step_index: turn.user_step_index || null,
+        assistant_step_index: turn.assistant_step_index || null,
+      });
+      writeJsonFile(statePath, {
+        ...sessionState,
+        last_ingested_step_index: lastProcessedStepIndex,
+        updated_at: new Date().toISOString(),
+      });
+      return;
+    }
+
+    processedCount += 1;
+    previousTurnSnapshot = buildTurnSnapshot(extracted, summary);
+    lastProcessedStepIndex = Math.max(lastProcessedStepIndex, turn.assistant_step_index || turn.user_step_index || -1);
+  }
+
+  writeJsonFile(statePath, {
+    ...sessionState,
+    cwd,
+    transcript_path: typeof payload.transcriptPath === "string" ? payload.transcriptPath : null,
+    last_turn_snapshot: previousTurnSnapshot,
+    last_ingested_step_index: lastProcessedStepIndex,
+    updated_at: new Date().toISOString(),
+  });
+
+  if (processedCount === 0 && skippedCount > 0) {
+    appendEvent(stateDir, "turn_skipped", { job_path: jobPath, reason: "low_signal_or_empty", skipped_count: skippedCount });
+    rmSync(jobPath, { force: true });
+    return;
+  }
+
+  appendEvent(stateDir, "job_ingested", {
+    target: project.target,
+    job_path: jobPath,
+    transcript_path: typeof payload.transcriptPath === "string" ? payload.transcriptPath : null,
+    processed_count: processedCount,
+    skipped_count: skippedCount,
+  });
+  rmSync(jobPath, { force: true });
+}
+
+function emitDecision() {
+  process.stdout.write(JSON.stringify({ decision: "allow" }) + "\\n");
+}
+
+async function main() {
+  if (process.argv[2] === "--worker") {
+    const jobPath = process.argv[3];
+    if (typeof jobPath === "string" && jobPath.length) {
+      runWorker(jobPath);
+    }
+    return;
+  }
+
+  const raw = await readStdin();
+  const payload = readJsonFromString(raw, {});
+  const eventName = String(process.argv[2] || payload.hookEventName || payload.hook_event_name || "stop").toLowerCase();
+  if (eventName === "stop") {
+    enqueueStopJob(payload);
+  }
+  emitDecision();
+}
+
+main().catch((error) => {
+  const stateDir = stateDirForCwd(process.cwd());
+  appendError(stateDir, "Unhandled Antigravity hook failure.", {
+    error: error instanceof Error ? error.stack || error.message : String(error),
+  });
+  emitDecision();
+});
+`;
+
+export const ANTIGRAVITY_SKILL_TEMPLATE = `---
+name: recallstack-memory
+description: Use Recallstack only for prior decisions, non-local history, recurring issue context, and other context that is not cheaper to verify directly in the current workspace.
+---
+
+# Recallstack Memory (Google Antigravity Local)
+
+Required setup:
+
+1. \`recallstack login <CODE>\`
+2. \`recallstack workspace use\`
+3. \`recallstack project use\`
+4. \`recallstack project\` to verify the target
+
+Retrieval protocol:
+
+1. Use the current thread and local files/logs/tests for facts that can be verified directly.
+2. Query Recallstack for prior decisions, rationale, related work, recurring issue history, user preferences, or other non-local context.
+3. Use \`recallstack memory query --query "<task>" --mode standard\` by default.
+4. Use \`mode=quick\` for fast checks, \`deep\` for fuller context, and \`forensic\` for investigative retrieval.
+5. Raw writes to \`global\` are forbidden. Ensure the configured target is non-global.
+
+Antigravity hook behavior:
+
+1. \`recallstack agent install antigravity\` installs this skill and a JSON Stop hook.
+2. The Stop hook reads Antigravity's transcript path, reconstructs completed turns, and queues memory ingestion in the background.
+3. The background worker runs an isolated JSON-schema extraction pass before ingesting so memory quality matches the Codex integration.
+4. Installing Antigravity CLI is recommended for native Antigravity synthesis when Recallstack supports its non-interactive extraction command. Until then the hook uses the configured fallback worker and then raw transcript extraction if no worker is available.
+5. The hook returns immediately so the Antigravity loop is not delayed.
+6. Do not spend thread space describing memory housekeeping unless the user asked, the hook failed, or the result materially changes the answer.
+
+Durable source guidance:
+
+1. Use \`recallstack memory source ingest\` for plans, handovers, specs, checklists, research notes, copied docs, meeting notes, and verified issue-remedy runbooks.
+2. Durable ingest is the default when the user says \`remember this\`, \`store this\`, \`save this\`, or asks for a long-lived reference note.
+3. Check durable memory before drafting a new durable artifact if prior documentation may already exist.
+4. After a remedy is verified and likely reusable, ingest it durably as a concise issue-remedy note with searchable metadata.
+`;
