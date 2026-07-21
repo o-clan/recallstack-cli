@@ -41,7 +41,12 @@ diff -u source-dist.sha256 retirement-dist.sha256
 npm pack ./package --dry-run --json > dry-run.json
 RETIREMENT_VERSION="$retirement_version" node <<'NODE'
 const fs = require("node:fs");
-const [result] = JSON.parse(fs.readFileSync("dry-run.json", "utf8"));
+const parsed = JSON.parse(fs.readFileSync("dry-run.json", "utf8"));
+const result = Array.isArray(parsed)
+  ? parsed[0]
+  : parsed.name
+    ? parsed
+    : Object.values(parsed)[0];
 if (result.name !== "recallstack") throw new Error("Unexpected package name");
 if (result.version !== process.env.RETIREMENT_VERSION) {
   throw new Error("Unexpected package version");
