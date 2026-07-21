@@ -415,8 +415,10 @@ func assertJSONContains(t *testing.T, path string, values ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
 	for _, value := range values {
-		if !strings.Contains(string(body), value) {
+		value = strings.ReplaceAll(value, "\r\n", "\n")
+		if !strings.Contains(text, value) {
 			t.Errorf("%s does not contain %q:\n%s", path, value, body)
 		}
 	}

@@ -19,7 +19,11 @@ func gitRun(t *testing.T, dir string, args ...string) {
 func TestCleanSnapshotCapturesChanges(t *testing.T) {
 	dir := t.TempDir()
 	gitRun(t, dir, "init", "-q")
-	gitRun(t, dir, "config", "core.excludesFile", os.DevNull)
+	excludeFile := filepath.Join(t.TempDir(), "empty-excludes")
+	if err := os.WriteFile(excludeFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "config", "core.excludesFile", excludeFile)
 	gitRun(t, dir, "config", "user.email", "test@example.com")
 	gitRun(t, dir, "config", "user.name", "Test")
 	path := filepath.Join(dir, "a.txt")

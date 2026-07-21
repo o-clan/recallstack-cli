@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$DefaultVersion = "1.2.1"
+$DefaultVersion = "1.2.2"
 $Version = if ($env:RECALLSTACK_VERSION) { $env:RECALLSTACK_VERSION } else { $DefaultVersion }
 
 if ($Help) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${RECALLSTACK_VERSION:-1.2.1}"
+VERSION="${RECALLSTACK_VERSION:-1.2.2}"
 INSTALL_DIR="${RECALLSTACK_INSTALL_DIR:-$HOME/.local/bin}"
 SOURCE_DIR="${RECALLSTACK_INSTALL_SOURCE_DIR:-}"
 BASE_URL="${RECALLSTACK_RELEASE_BASE_URL:-https://github.com/o-clan/recallstack-cli/releases/download/v${VERSION}}"
