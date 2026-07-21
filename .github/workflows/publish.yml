@@ -1,6 +1,7 @@
 name: Publish CLI
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -14,6 +15,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
@@ -91,3 +93,26 @@ jobs:
               exit 1
             }
           done
+
+  publish-npm-retirement:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm
+        run: npm install --global npm@latest
+
+      - name: Publish final npm retirement release
+        run: bash .github/npm-retirement/publish.sh
