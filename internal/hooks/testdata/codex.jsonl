@@ -1,0 +1,5 @@
+{"type":"response_item","timestamp":"2026-07-21T09:00:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Older response"}]}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-native"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Port the hooks to Go"}]}}
+{"type":"response_item","timestamp":"2026-07-21T09:01:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"All hooks are native"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-native","last_agent_message":"All hooks are native"}}

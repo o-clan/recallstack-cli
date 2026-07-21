@@ -1,46 +1,68 @@
 # Recallstack CLI
 
-Recallstack CLI is the installable command-line interface for Recallstack.
-
-It provides:
-
-- authentication against the Recallstack API
-- project and workspace targeting
-- memory ingest and retrieval commands
-- agent hook installers for Codex, Claude Code, Cursor, GitHub Copilot, and Google Antigravity
+Recallstack is a standalone native CLI for authentication, workspace and project targeting, memory retrieval and ingestion, and agent memory integrations.
 
 ## Install
 
-```bash
-npm install -g recallstack
-```
+Recallstack is distributed only as native release binaries. npm and npx installs are no longer supported or published.
 
-Or run it without a global install:
+### macOS and Linux
 
 ```bash
-npx recallstack@latest --help
+curl -fsSL https://github.com/o-clan/recallstack-cli/releases/latest/download/install.sh | bash
 ```
 
-## Requirements
+The installer selects the correct binary, verifies it against `SHA256SUMS`, and installs it to `~/.local/bin` by default.
 
-- Node.js 20 or later
+### Windows PowerShell
 
-## Common Commands
+```powershell
+irm https://github.com/o-clan/recallstack-cli/releases/latest/download/install.ps1 | iex
+```
+
+The installer verifies the binary checksum, installs it for the current user, and adds its directory to the user `PATH`.
+
+### Migrating from npm
+
+The [historical npm package](https://www.npmjs.com/package/recallstack) is retired and remains available only to direct existing users to the native CLI. Remove the global npm installation, then use the installer above. Existing Recallstack configuration and project state are preserved.
+
+## Verify a manual download
+
+Each release contains binaries for Linux, macOS, and Windows on amd64 and arm64, plus `SHA256SUMS`.
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+On macOS, use `shasum -a 256 -c SHA256SUMS`.
+
+Release binaries are currently checksummed but are not code-signed or notarized. macOS Gatekeeper or Windows SmartScreen may show a warning for a manual download.
+
+## Common commands
 
 ```bash
 recallstack --help
 recallstack login
-recallstack project list
+recallstack workspace use
+recallstack project use
 recallstack memory query --query "What changed?"
 recallstack agent install codex
 ```
 
-## Auth Storage
+The CLI stores its existing configuration, authentication profiles, pending writes, and project state in the same locations and formats used by earlier releases.
 
-The CLI stores its auth profile on the local machine so it can reuse your session across commands. Review the source before use if you want to audit or modify that behavior.
+Authentication tokens and API keys use the platform secure store by default: Keychain on macOS, Secret Service on Linux, and Credential Manager on Windows. If the secure store is unavailable while saving credentials, Recallstack falls back to its permission-restricted local configuration file. Set `RECALLSTACK_TOKEN_STORE=file` to explicitly use file storage.
 
-Memory writes that cannot be sent because authentication is missing or expired are now queued locally and replayed after the next successful login. Hook-driven turn ingests use the same protection.
+Agent integrations now invoke the native CLI directly. Re-run `recallstack agent install <target>` after upgrading an existing Node-based installation so old hook commands are replaced.
 
-## Public Source
+## Release assets
 
-This repository is the public source mirror for the Recallstack CLI package published to npm. The packaged CLI is intended to be auditable and forkable.
+Each native release includes:
+
+- Linux amd64 and arm64 binaries
+- macOS amd64 and arm64 binaries
+- Windows amd64 and arm64 binaries
+- `SHA256SUMS`
+- POSIX and PowerShell installers
+
+The public repository is the auditable source mirror for the native CLI.

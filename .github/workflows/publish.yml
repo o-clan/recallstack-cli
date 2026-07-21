@@ -2,16 +2,14 @@ name: Publish CLI
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    tags:
+      - "v*.*.*"
 
 permissions:
-  contents: read
-  id-token: write
+  contents: write
 
 concurrency:
-  group: publish-cli-main
+  group: publish-cli-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -21,41 +19,75 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
+          fetch-depth: 0
 
-      - name: Install dependencies
-        run: npm install
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
 
-      - name: Check CLI release version
-        id: cli_version
+      - name: Validate release version
         shell: bash
         run: |
           set -euo pipefail
-          package_name="$(node -p "require('./package.json').name")"
-          package_version="$(node -p "require('./package.json').version")"
-          echo "name=$package_name" >> "$GITHUB_OUTPUT"
-          echo "version=$package_version" >> "$GITHUB_OUTPUT"
-          if npm view "$package_name@$package_version" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "CLI $package_name@$package_version already exists on npm."
+          bash scripts/check-version.sh
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match VERSION $version" >&2
+            exit 1
+          }
+
+      - name: Test native CLI
+        run: go test ./...
+
+      - name: Vet native CLI
+        run: go vet ./...
+
+      - name: Build and smoke release assets
+        run: bash ./scripts/package-cli-smoke.sh
+
+      - name: Scan release binaries for vulnerabilities
+        run: bash ./scripts/vulncheck-release.sh
+
+      - name: Create or refresh GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "CLI $package_name@$package_version will be published."
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
           fi
 
-      - name: Build CLI
-        if: steps.cli_version.outputs.publish == 'true'
-        run: npm run build
-
-      - name: Run CLI tests
-        if: steps.cli_version.outputs.publish == 'true'
-        run: npm run test
-
-      - name: Publish CLI
-        if: steps.cli_version.outputs.publish == 'true'
-        run: npm publish --access public --provenance
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          expected=(
+            "recallstack_${version}_linux_amd64"
+            "recallstack_${version}_linux_arm64"
+            "recallstack_${version}_darwin_amd64"
+            "recallstack_${version}_darwin_arm64"
+            "recallstack_${version}_windows_amd64.exe"
+            "recallstack_${version}_windows_arm64.exe"
+            "SHA256SUMS"
+            "install.sh"
+            "install.ps1"
+          )
+          assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+          for name in "${expected[@]}"; do
+            grep -Fx "$name" <<< "$assets" >/dev/null || {
+              echo "Release is missing $name" >&2
+              exit 1
+            }
+          done
