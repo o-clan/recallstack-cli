@@ -1,6 +1,6 @@
 # Recallstack CLI
 
-Recallstack is a standalone native CLI for authentication, workspace and project targeting, memory retrieval and ingestion, and agent memory integrations.
+Recallstack keeps your goals, decisions and taste, and briefs every coding agent with them. This is its native CLI: sign-in, connecting agents, the hooks those agents run, and the commands agents use to record and settle thoughts.
 
 ## Install
 
@@ -41,19 +41,19 @@ Release binaries are currently checksummed but are not code-signed or notarized.
 ## Common commands
 
 ```bash
-recallstack --help
-recallstack login
-recallstack workspace use
-recallstack project use
-recallstack memory query --query "What changed?"
-recallstack agent install codex
+recallstack login                 # opens the browser and shows a code to match
+recallstack agent install         # connects every agent on this computer
+recallstack brief                 # exactly what the next session will be told
+recallstack import                # turns rules you wrote for agents into thoughts
+recallstack why "<topic or ref>"  # why something is the way it is
+recallstack agent status
 ```
 
-The CLI stores its existing configuration, authentication profiles, pending writes, and project state in the same locations and formats used by earlier releases.
+Agents run `recallstack note`, `hold`, `resolve`, `adjust`, `drop` and `undo` themselves; the installed skill teaches them when.
 
-Authentication tokens and API keys use the platform secure store by default: Keychain on macOS, Secret Service on Linux, and Credential Manager on Windows. If the secure store is unavailable while saving credentials, Recallstack falls back to its permission-restricted local configuration file. Set `RECALLSTACK_TOKEN_STORE=file` to explicitly use file storage.
+Everything the CLI keeps lives in `~/.recallstack` (set `RECALLSTACK_HOME` to move it). Nothing is written into your repos, except Cursor's brief rule (`.cursor/rules/recallstack-brief.mdc`, kept out of git through `.git/info/exclude`). Transcripts never leave the computer: only the extracted thoughts, each with the person's exact words, after secrets are stripped.
 
-Agent integrations now invoke the native CLI directly. Re-run `recallstack agent install <target>` after upgrading an existing Node-based installation so old hook commands are replaced.
+Sign-in tokens use the platform secure store by default: Keychain on macOS, Secret Service on Linux, and Credential Manager on Windows. If it's unavailable, Recallstack falls back to its permission-restricted config file. Set `RECALLSTACK_TOKEN_STORE=file` to use file storage explicitly.
 
 ## Release assets
 

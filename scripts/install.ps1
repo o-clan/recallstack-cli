@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$DefaultVersion = "1.2.2"
+$DefaultVersion = "2.0.1"
 $Version = if ($env:RECALLSTACK_VERSION) { $env:RECALLSTACK_VERSION } else { $DefaultVersion }
 
 if ($Help) {
@@ -77,9 +77,9 @@ try {
         $env:Path = "$InstallDir;$env:Path"
     }
 
-    Write-Output "Recallstack CLI $Version installed to $Destination"
-    Write-Output "Version: $InstalledVersion"
-    Write-Output "Run: recallstack --help"
+    Write-Output "✓ Installed to $Destination"
+    Write-Output ""
+    Write-Output "Next, sign in:  recallstack login"
 } finally {
     if ($TemporaryDestination -and (Test-Path -LiteralPath $TemporaryDestination)) {
         Remove-Item -Force -LiteralPath $TemporaryDestination

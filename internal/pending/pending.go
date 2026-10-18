@@ -1,7 +1,9 @@
+// Package pending is the queue of writes that couldn't be sent yet: offline,
+// rate limited, server errors, or waiting on sign-in. Each write is replayed
+// with its Idempotency-Key, so the server applies it once.
 package pending
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -10,58 +12,53 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/o-clan/recallstack-cli/internal/api"
 	"github.com/o-clan/recallstack-cli/internal/config"
-	"golang.org/x/text/collate"
-	"golang.org/x/text/language"
-)
-
-type Kind string
-
-const (
-	KindEvent  Kind = "event"
-	KindSource Kind = "source"
 )
 
 type LastError struct {
 	Message string `json:"message"`
 	Code    string `json:"code,omitempty"`
+	Status  int    `json:"status,omitempty"`
 }
 
 type Record struct {
-	ID            string         `json:"id"`
-	Fingerprint   string         `json:"fingerprint"`
-	Kind          Kind           `json:"kind"`
-	BaseURL       string         `json:"baseUrl"`
-	WorkspaceID   string         `json:"workspaceId"`
-	ProjectToken  string         `json:"projectToken"`
-	Endpoint      string         `json:"endpoint"`
-	Body          map[string]any `json:"body"`
-	Origin        string         `json:"origin"`
-	Cwd           string         `json:"cwd,omitempty"`
-	QueuedAt      string         `json:"queuedAt"`
-	ReplayCount   int            `json:"replayCount"`
-	QueueReason   string         `json:"queueReason"`
-	LastError     *LastError     `json:"lastError,omitempty"`
-	LastAttemptAt string         `json:"lastAttemptAt,omitempty"`
+	ID             string         `json:"id"`
+	Fingerprint    string         `json:"fingerprint"`
+	BaseURL        string         `json:"baseUrl"`
+	Method         string         `json:"method"`
+	Endpoint       string         `json:"endpoint"`
+	Body           map[string]any `json:"body"`
+	IdempotencyKey string         `json:"idempotencyKey,omitempty"`
+	Label          string         `json:"label,omitempty"`
+	ChangeID       string         `json:"changeId,omitempty"`
+	Origin         string         `json:"origin"`
+	Cwd            string         `json:"cwd,omitempty"`
+	QueuedAt       string         `json:"queuedAt"`
+	ReplayCount    int            `json:"replayCount"`
+	QueueReason    string         `json:"queueReason"`
+	LastError      *LastError     `json:"lastError,omitempty"`
+	LastAttemptAt  string         `json:"lastAttemptAt,omitempty"`
 }
 
 type QueueInput struct {
-	Kind         Kind
-	BaseURL      string
-	WorkspaceID  string
-	ProjectToken string
-	Body         map[string]any
-	Origin       string
-	Cwd          string
-	QueueReason  string
-	LastError    *LastError
+	BaseURL        string
+	Method         string
+	Endpoint       string
+	Body           map[string]any
+	IdempotencyKey string
+	Label          string
+	ChangeID       string
+	Origin         string
+	Cwd            string
+	QueueReason    string
+	LastError      *LastError
 }
 
 type QueueResult struct {
@@ -73,6 +70,8 @@ type FlushResult struct {
 	Attempted     int
 	Replayed      int
 	Failed        int
+	Dropped       int
+	Expired       int
 	BlockedByAuth bool
 	Remaining     int
 }
@@ -84,11 +83,16 @@ type Store struct {
 	Clock func() time.Time
 }
 
-func NewStore(homeDir string) *Store {
-	if strings.TrimSpace(homeDir) == "" {
-		homeDir, _ = os.UserHomeDir()
+// NewStore opens the queue in dir (state.PendingDir() for the real one).
+func NewStore(dir string) *Store { return &Store{Dir: dir, Clock: time.Now} }
+
+// Window is how long a retryable write is kept (24 hours by default).
+func Window() time.Duration {
+	value, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("RECALLSTACK_INGEST_RETRY_WINDOW_MS")), 10, 64)
+	if err != nil || value <= 0 {
+		return 24 * time.Hour
 	}
-	return &Store{Dir: filepath.Join(homeDir, ".recallstack", "pending-writes"), Clock: time.Now}
+	return time.Duration(value) * time.Millisecond
 }
 
 func (s *Store) now() time.Time {
@@ -98,98 +102,20 @@ func (s *Store) now() time.Time {
 	return time.Now()
 }
 
-func jsISO(value time.Time) string {
-	return value.UTC().Format("2006-01-02T15:04:05.000Z")
-}
+const isoLayout = "2006-01-02T15:04:05.000Z"
+
+func jsISO(value time.Time) string { return value.UTC().Format(isoLayout) }
 
 func (s *Store) path(id string) string { return filepath.Join(s.Dir, id+".json") }
 
-func canonicalJSON(value any) ([]byte, error) {
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
-		return nil, err
+func fingerprint(input QueueInput) string {
+	seed := input.BaseURL + "\n" + input.IdempotencyKey
+	if input.IdempotencyKey == "" {
+		body, _ := json.Marshal(input.Body)
+		seed = input.BaseURL + "\n" + input.Method + "\n" + input.Endpoint + "\n" + string(body)
 	}
-	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
-}
-
-func stableJSON(value any) ([]byte, error) {
-	var buffer bytes.Buffer
-	comparison := collate.New(language.English)
-	var writeValue func(reflect.Value) error
-	writeValue = func(current reflect.Value) error {
-		if !current.IsValid() || ((current.Kind() == reflect.Interface || current.Kind() == reflect.Pointer) && current.IsNil()) {
-			buffer.WriteString("null")
-			return nil
-		}
-		for current.Kind() == reflect.Interface || current.Kind() == reflect.Pointer {
-			current = current.Elem()
-		}
-		switch current.Kind() {
-		case reflect.Map:
-			if current.Type().Key().Kind() != reflect.String {
-				return fmt.Errorf("stable JSON requires string map keys")
-			}
-			keys := current.MapKeys()
-			sort.SliceStable(keys, func(i, j int) bool {
-				left, right := keys[i].String(), keys[j].String()
-				if order := comparison.CompareString(left, right); order != 0 {
-					return order < 0
-				}
-				return left < right
-			})
-			buffer.WriteByte('{')
-			for index, key := range keys {
-				if index > 0 {
-					buffer.WriteByte(',')
-				}
-				encodedKey, _ := canonicalJSON(key.String())
-				buffer.Write(encodedKey)
-				buffer.WriteByte(':')
-				if err := writeValue(current.MapIndex(key)); err != nil {
-					return err
-				}
-			}
-			buffer.WriteByte('}')
-			return nil
-		case reflect.Slice, reflect.Array:
-			buffer.WriteByte('[')
-			for index := 0; index < current.Len(); index++ {
-				if index > 0 {
-					buffer.WriteByte(',')
-				}
-				if err := writeValue(current.Index(index)); err != nil {
-					return err
-				}
-			}
-			buffer.WriteByte(']')
-			return nil
-		default:
-			raw, err := canonicalJSON(current.Interface())
-			if err != nil {
-				return err
-			}
-			buffer.Write(raw)
-			return nil
-		}
-	}
-	if err := writeValue(reflect.ValueOf(value)); err != nil {
-		return nil, err
-	}
-	return buffer.Bytes(), nil
-}
-
-func fingerprint(input QueueInput) (string, error) {
-	raw, err := stableJSON(map[string]any{
-		"kind": string(input.Kind), "baseUrl": input.BaseURL, "workspaceId": input.WorkspaceID,
-		"projectToken": input.ProjectToken, "body": input.Body,
-	})
-	if err != nil {
-		return "", err
-	}
-	sum := sha1.Sum(raw)
-	return hex.EncodeToString(sum[:]), nil
+	sum := sha1.Sum([]byte(seed))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Store) readAll() []Record {
@@ -217,14 +143,13 @@ func (s *Store) readAll() []Record {
 }
 
 func valid(record Record) bool {
-	return record.ID != "" && record.Fingerprint != "" &&
-		(record.Kind == KindEvent || record.Kind == KindSource) &&
-		record.BaseURL != "" && record.WorkspaceID != "" && record.ProjectToken != "" &&
-		(record.Endpoint == "/v1/memory/events" || record.Endpoint == "/v1/memory/sources") && record.Body != nil
+	return record.ID != "" && record.Fingerprint != "" && record.BaseURL != "" &&
+		strings.HasPrefix(record.Endpoint, "/v1/") && record.Body != nil &&
+		(record.Method == "POST" || record.Method == "PATCH" || record.Method == "PUT")
 }
 
 func (s *Store) write(record Record) error {
-	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(record, "", "  ")
@@ -252,58 +177,42 @@ func (s *Store) write(record Record) error {
 	return os.Rename(tmpName, s.path(record.ID))
 }
 
+// Queue adds a write, or refreshes the existing one with the same key.
 func (s *Store) Queue(input QueueInput) (QueueResult, error) {
 	var result QueueResult
 	err := s.withLock(func() error {
-		var err error
-		result, err = s.queueUnlocked(input)
-		return err
+		fp := fingerprint(input)
+		for _, existing := range s.readAll() {
+			if existing.Fingerprint != fp {
+				continue
+			}
+			existing.QueueReason = input.QueueReason
+			if input.LastError != nil {
+				existing.LastError = input.LastError
+			}
+			result = QueueResult{Record: existing, Duplicate: true}
+			return s.write(existing)
+		}
+		now := s.now()
+		sum := sha1.Sum([]byte(fmt.Sprintf("%s:%d", fp, now.UnixNano())))
+		method := input.Method
+		if method == "" {
+			method = "POST"
+		}
+		record := Record{
+			ID: hex.EncodeToString(sum[:]), Fingerprint: fp, BaseURL: input.BaseURL, Method: method,
+			Endpoint: input.Endpoint, Body: input.Body, IdempotencyKey: input.IdempotencyKey,
+			Label: input.Label, ChangeID: input.ChangeID, Origin: input.Origin, Cwd: input.Cwd,
+			QueuedAt: jsISO(now), QueueReason: input.QueueReason, LastError: input.LastError,
+		}
+		result = QueueResult{Record: record}
+		return s.write(record)
 	})
 	return result, err
 }
 
-func (s *Store) queueUnlocked(input QueueInput) (QueueResult, error) {
-	fp, err := fingerprint(input)
-	if err != nil {
-		return QueueResult{}, err
-	}
-	for _, existing := range s.readAll() {
-		if existing.Fingerprint != fp {
-			continue
-		}
-		existing.QueueReason = input.QueueReason
-		if input.LastError != nil {
-			existing.LastError = input.LastError
-		}
-		if input.Cwd != "" {
-			existing.Cwd = input.Cwd
-		}
-		if err := s.write(existing); err != nil {
-			return QueueResult{}, err
-		}
-		return QueueResult{Record: existing, Duplicate: true}, nil
-	}
-	now := s.now()
-	idSource := fmt.Sprintf("%s:%d", fp, now.UnixMilli())
-	sum := sha1.Sum([]byte(idSource))
-	endpoint := "/v1/memory/events"
-	if input.Kind == KindSource {
-		endpoint = "/v1/memory/sources"
-	}
-	record := Record{
-		ID: hex.EncodeToString(sum[:]), Fingerprint: fp, Kind: input.Kind, BaseURL: input.BaseURL,
-		WorkspaceID: input.WorkspaceID, ProjectToken: input.ProjectToken, Endpoint: endpoint,
-		Body: input.Body, Origin: input.Origin, Cwd: input.Cwd, QueuedAt: jsISO(now),
-		ReplayCount: 0, QueueReason: input.QueueReason, LastError: input.LastError,
-	}
-	if err := s.write(record); err != nil {
-		return QueueResult{}, err
-	}
-	return QueueResult{Record: record}, nil
-}
-
 func (s *Store) withLock(fn func() error) error {
-	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
 	}
 	lockPath := filepath.Join(s.Dir, ".queue.lock")
@@ -330,6 +239,7 @@ func (s *Store) withLock(fn func() error) error {
 	}
 }
 
+// List returns queued writes for baseURL (all when empty), oldest first.
 func (s *Store) List(baseURL string) []Record {
 	records := s.readAll()
 	if baseURL == "" {
@@ -352,13 +262,52 @@ func (s *Store) Remove(id string) error {
 	return err
 }
 
+// RemoveByID removes one queued write under the queue lock.
+func (s *Store) RemoveByID(id string) (bool, error) {
+	removed := false
+	err := s.withLock(func() error {
+		if _, statErr := os.Stat(s.path(id)); statErr == nil {
+			removed = true
+		}
+		return s.Remove(id)
+	})
+	return removed, err
+}
+
+// FindByChangeID returns the queued write carrying changeID.
+func (s *Store) FindByChangeID(changeID string) (Record, bool) {
+	if changeID == "" {
+		return Record{}, false
+	}
+	for _, record := range s.readAll() {
+		if record.ChangeID == changeID {
+			return record, true
+		}
+	}
+	return Record{}, false
+}
+
+// Flush replays queued writes for cfg's base URL, oldest first. A write that
+// fails for good (a 4xx other than 401 and 429) is dropped; a retryable one
+// stays; a 401 stops the flush until the next sign-in. Retryable writes older
+// than Window() expire; writes waiting on sign-in don't.
 func (s *Store) Flush(ctx context.Context, cfg config.Config, sender Sender) (FlushResult, error) {
 	if sender == nil {
 		return FlushResult{}, errors.New("pending write sender is required")
 	}
 	result := FlushResult{}
 	err := s.withLock(func() error {
+		window := Window()
 		for _, record := range s.List(cfg.EffectiveBaseURL) {
+			if ctx.Err() != nil {
+				break
+			}
+			queuedAt, _ := time.Parse(isoLayout, record.QueuedAt)
+			if record.QueueReason != "auth_required" && !queuedAt.IsZero() && s.now().Sub(queuedAt) > window {
+				result.Expired++
+				_ = s.Remove(record.ID)
+				continue
+			}
 			result.Attempted++
 			err := sender(ctx, record, cfg)
 			if err == nil {
@@ -368,14 +317,23 @@ func (s *Store) Flush(ctx context.Context, cfg config.Config, sender Sender) (Fl
 				}
 				continue
 			}
+			auth := IsAuthRequired(err)
+			if !auth && !api.Retryable(err) {
+				result.Dropped++
+				_ = s.Remove(record.ID)
+				continue
+			}
+			if auth {
+				record.QueueReason = "auth_required"
+			}
 			record.ReplayCount++
 			record.LastAttemptAt = jsISO(s.now())
-			record.LastError = &LastError{Message: err.Error(), Code: errorCode(err)}
+			record.LastError = &LastError{Message: err.Error(), Code: api.Code(err), Status: api.Status(err)}
 			if writeErr := s.write(record); writeErr != nil {
 				return writeErr
 			}
 			result.Failed++
-			if IsAuthRequired(err) {
+			if auth {
 				result.BlockedByAuth = true
 				break
 			}
@@ -386,43 +344,20 @@ func (s *Store) Flush(ctx context.Context, cfg config.Config, sender Sender) (Fl
 	return result, err
 }
 
-var authRequiredPattern = regexp.MustCompile(`(?i)not authenticated|authentication expired|http 401|invalid refresh token|unauthorized`)
+var authRequiredPattern = regexp.MustCompile(`(?i)not signed in|not authenticated|authentication expired|http 401|invalid refresh token|unauthorized`)
 
+// IsAuthRequired reports a 401, or an auth manager "not signed in" error.
 func IsAuthRequired(err error) bool {
 	if err == nil {
 		return false
 	}
 	var httpErr *api.HTTPError
-	return (errors.As(err, &httpErr) && httpErr.Status == 401) || authRequiredPattern.MatchString(err.Error())
-}
-
-func AuthQueueReason(err error) string {
-	var httpErr *api.HTTPError
-	if errors.As(err, &httpErr) && httpErr.Status == 401 {
-		return "HTTP_401"
-	}
-	message := ""
-	if err != nil {
-		message = strings.ToLower(err.Error())
-	}
-	if strings.Contains(message, "authentication expired") {
-		return "AUTHENTICATION_EXPIRED"
-	}
-	if strings.Contains(message, "not authenticated") {
-		return "NOT_AUTHENTICATED"
-	}
-	return "AUTH_REQUIRED"
-}
-
-func errorCode(err error) string {
-	var httpErr *api.HTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.Code
+		return httpErr.Status == 401
 	}
-	type coder interface{ Code() string }
-	var coded coder
-	if errors.As(err, &coded) {
-		return coded.Code()
+	var transport *api.TransportError
+	if errors.As(err, &transport) {
+		return false
 	}
-	return ""
+	return authRequiredPattern.MatchString(err.Error())
 }

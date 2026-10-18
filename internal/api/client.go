@@ -32,6 +32,77 @@ type RequestOptions struct {
 	Token       string
 	WorkspaceID string
 	Headers     map[string]string
+	// ResponseHeader, when set, receives the response headers (ETag, Idempotent-Replay).
+	ResponseHeader *http.Header
+}
+
+// TransportError is a request that never got an HTTP response (offline, DNS,
+// refused, timed out). Callers treat it as retryable.
+type TransportError struct {
+	Message string
+	Err     error
+}
+
+func (e *TransportError) Error() string { return e.Message }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// Retryable reports whether err should be queued and replayed later: transport
+// failures, 429 and 5xx. 401 is handled separately (auth_required).
+func Retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transport *TransportError
+	if errors.As(err, &transport) {
+		return true
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status == http.StatusTooManyRequests || httpErr.Status >= 500
+	}
+	return false
+}
+
+// Status returns the HTTP status of err, or 0.
+func Status(err error) int {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status
+	}
+	return 0
+}
+
+// Code returns the error envelope code of err, or "".
+func Code(err error) string {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Code
+	}
+	return ""
+}
+
+// Details returns error.details from the envelope.
+func Details(err error) map[string]any {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return nil
+	}
+	root, _ := httpErr.Payload.(map[string]any)
+	nested, _ := root["error"].(map[string]any)
+	details, _ := nested["details"].(map[string]any)
+	return details
+}
+
+// Message returns error.message from the envelope.
+func Message(err error) string {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return ""
+	}
+	root, _ := httpErr.Payload.(map[string]any)
+	nested, _ := root["error"].(map[string]any)
+	message, _ := nested["message"].(string)
+	return message
 }
 
 type Client struct {
@@ -97,9 +168,15 @@ func (c *Client) DoJSON(ctx context.Context, path string, options RequestOptions
 		return wrapTransportError(target, err)
 	}
 	defer response.Body.Close()
+	if options.ResponseHeader != nil {
+		*options.ResponseHeader = response.Header.Clone()
+	}
+	if response.StatusCode == http.StatusNotModified {
+		return &HTTPError{Status: http.StatusNotModified, Payload: map[string]any{}}
+	}
 	raw, readErr := io.ReadAll(response.Body)
 	if readErr != nil {
-		return readErr
+		return &TransportError{Message: readErr.Error(), Err: readErr}
 	}
 	var payload any = map[string]any{}
 	validJSON := false
@@ -183,7 +260,7 @@ func wrapTransportError(target string, err error) error {
 	message := fmt.Sprintf("Request to %s failed: %s.", target, err.Error())
 	parsed, parseErr := url.Parse(target)
 	if parseErr != nil || parsed.Scheme != "https" || !isLocalhost(parsed.Hostname()) {
-		return errors.New(message)
+		return &TransportError{Message: message, Err: err}
 	}
 	text := strings.ToLower(err.Error())
 	var opErr *net.OpError
@@ -191,12 +268,12 @@ func wrapTransportError(target string, err error) error {
 		text += " " + strings.ToLower(opErr.Error())
 	}
 	if strings.Contains(text, "server gave http response to https client") || strings.Contains(text, "first record does not look like a tls handshake") {
-		return fmt.Errorf("%s Local Recallstack dev listens on http by default. Try `recallstack config base-url http://%s` or enable HTTPS for your local API", message, parsed.Host)
+		return &TransportError{Message: fmt.Sprintf("%s Local Recallstack dev listens on http by default. Try `recallstack config base-url http://%s` or enable HTTPS for your local API", message, parsed.Host), Err: err}
 	}
 	if strings.Contains(text, "certificate") || strings.Contains(text, "x509") {
-		return fmt.Errorf("%s Local HTTPS certificate validation failed. Trust your local certificate, use a hostname covered by the cert, or switch to `http://%s` for the default dev stack", message, parsed.Host)
+		return &TransportError{Message: fmt.Sprintf("%s Local HTTPS certificate validation failed. Trust your local certificate, use a hostname covered by the cert, or switch to `http://%s` for the default dev stack", message, parsed.Host), Err: err}
 	}
-	return errors.New(message)
+	return &TransportError{Message: message, Err: err}
 }
 
 func isLocalhost(host string) bool {

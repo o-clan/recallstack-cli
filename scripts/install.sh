@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${RECALLSTACK_VERSION:-1.2.2}"
+VERSION="${RECALLSTACK_VERSION:-2.0.1}"
 INSTALL_DIR="${RECALLSTACK_INSTALL_DIR:-$HOME/.local/bin}"
 SOURCE_DIR="${RECALLSTACK_INSTALL_SOURCE_DIR:-}"
 BASE_URL="${RECALLSTACK_RELEASE_BASE_URL:-https://github.com/o-clan/recallstack-cli/releases/download/v${VERSION}}"
@@ -102,9 +102,14 @@ esac
 mv -f "$temporary_destination" "$destination"
 temporary_destination=""
 
-echo "Recallstack CLI $VERSION installed to $destination"
-echo "Version: $installed_version"
-case ":$PATH:" in
-  *":$INSTALL_DIR:"*) echo "Run: recallstack --help" ;;
-  *) echo "Add $INSTALL_DIR to PATH, then run: recallstack --help" ;;
+case "$destination" in
+  "$HOME"/*) shown="~${destination#"$HOME"}" ;;
+  *) shown="$destination" ;;
 esac
+echo "✓ Installed to $shown"
+echo
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) echo "Add $INSTALL_DIR to your PATH first." ;;
+esac
+echo "Next, sign in:  recallstack login"

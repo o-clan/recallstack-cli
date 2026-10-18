@@ -8,10 +8,12 @@ import (
 type optionSpec struct {
 	values map[string]struct{}
 	bools  map[string]struct{}
+	lists  map[string]struct{}
 }
 
 type parsedOptions struct {
 	positionals []string
+	lists       map[string][]string
 	values      map[string]string
 	bools       map[string]bool
 	present     map[string]bool
@@ -29,12 +31,23 @@ func newOptionSpec(valueNames []string, boolNames []string) optionSpec {
 		spec.bools[name] = struct{}{}
 	}
 	spec.bools["help"] = struct{}{}
+	spec.lists = map[string]struct{}{}
+	return spec
+}
+
+// withLists marks value options that may repeat (--instead-of a --instead-of b).
+func (spec optionSpec) withLists(names ...string) optionSpec {
+	for _, name := range names {
+		spec.values[name] = struct{}{}
+		spec.lists[name] = struct{}{}
+	}
 	return spec
 }
 
 func parseOptions(args []string, spec optionSpec) (parsedOptions, error) {
 	parsed := parsedOptions{
 		values:  map[string]string{},
+		lists:   map[string][]string{},
 		bools:   map[string]bool{},
 		present: map[string]bool{},
 	}
@@ -75,6 +88,9 @@ func parseOptions(args []string, spec optionSpec) (parsedOptions, error) {
 		}
 		if value == "" {
 			return parsed, fmt.Errorf("option --%s requires a value", name)
+		}
+		if _, ok := spec.lists[name]; ok {
+			parsed.lists[name] = append(parsed.lists[name], value)
 		}
 		parsed.values[name] = value
 		parsed.present[name] = true

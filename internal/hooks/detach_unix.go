@@ -22,3 +22,7 @@ func startDetached(executable string, args []string, cwd string, env []string) (
 	_ = command.Process.Release()
 	return pid, nil
 }
+
+func processAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}

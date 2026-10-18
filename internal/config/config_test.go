@@ -52,48 +52,6 @@ func (f *fakeSecureStore) Delete(service, account string) error {
 	return nil
 }
 
-func TestLoadResolvesProjectOverrideAndEndpointProfile(t *testing.T) {
-	t.Setenv("RECALLSTACK_TOKEN_STORE", "file")
-	home := t.TempDir()
-	project := filepath.Join(t.TempDir(), "repo")
-	nested := filepath.Join(project, "a", "b")
-	if err := os.MkdirAll(filepath.Join(project, ".recallstack"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(nested, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	global := `{
-  "baseUrl": "https://api.recallstack.com/",
-  "profiles": {
-    "https://api.recallstack.com": {"accessToken":"prod-token"},
-    "http://localhost:3001": {"apiKey":"local-key","activeWorkspaceSlug":"local"}
-  }
-}`
-	if err := os.MkdirAll(filepath.Join(home, ".recallstack"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".recallstack", "config.json"), []byte(global), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(project, ".recallstack", "config.json"), []byte(`{"baseUrl":"http://localhost:3001/"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	store := &Store{HomeDir: home, GOOS: "linux"}
-	resolved := store.Resolve(nested)
-	if resolved.Scope != ScopeProject || resolved.ScopeRoot != project {
-		t.Fatalf("unexpected resolution: %+v", resolved)
-	}
-	cfg, err := store.Load(nested)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.EffectiveBaseURL != "http://localhost:3001" || cfg.APIKey != "local-key" || cfg.AccessToken != "" {
-		t.Fatalf("unexpected config: %+v", cfg)
-	}
-}
-
 func TestKeyringStorageUsesCompatibleServiceAndAccount(t *testing.T) {
 	t.Setenv("RECALLSTACK_TOKEN_STORE", "")
 	home := t.TempDir()

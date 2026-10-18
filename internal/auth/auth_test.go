@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -153,51 +152,5 @@ func TestAuthenticatedJSONRefreshesAndFallsBackToAPIKey(t *testing.T) {
 	cfg, _ := store.Load(cwd)
 	if cfg.AccessToken != "" || cfg.RefreshToken != "" || cfg.APIKey != "api-good" {
 		t.Fatalf("expired JWT chain not cleared safely: %+v", cfg)
-	}
-}
-
-func TestLoginAndBestEffortLogoutPreserveCompatibility(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		if r.URL.Path == "/v1/auth/cli/code/exchange" {
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["code"] != "CODE" {
-				t.Errorf("unexpected body: %#v", body)
-			}
-			_, _ = w.Write([]byte(`{"access_token":"access","refresh_token":"refresh"}`))
-			return
-		}
-		if r.URL.Path == "/v1/auth/logout" {
-			w.WriteHeader(500)
-			_, _ = w.Write([]byte(`{"error":{"code":"DOWN"}}`))
-			return
-		}
-		w.WriteHeader(404)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-	store, cwd := configuredStore(t, server.URL)
-	if err := store.UpdateProfile(server.URL, config.ProfilePatch{APIKey: config.String("old-key")}); err != nil {
-		t.Fatal(err)
-	}
-	manager := NewManager(store, cwd, "test")
-	if err := manager.LoginWithCode(context.Background(), " CODE ", nil); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _ := store.Load(cwd)
-	if cfg.AccessToken != "access" || cfg.RefreshToken != "refresh" || cfg.APIKey != "" {
-		t.Fatalf("login profile wrong: %+v", cfg)
-	}
-	result, err := manager.Logout(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.RemoteRevoked || result.Warning == "" {
-		t.Fatalf("unexpected logout result: %+v", result)
-	}
-	cfg, _ = store.Load(cwd)
-	if cfg.AccessToken != "" || cfg.RefreshToken != "" || cfg.APIKey != "" {
-		t.Fatalf("logout did not clear tokens: %+v", cfg)
 	}
 }

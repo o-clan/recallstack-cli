@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 
+	"github.com/o-clan/recallstack-cli/internal/hooks"
 	"github.com/o-clan/recallstack-cli/internal/telemetry"
 )
 
@@ -17,25 +19,85 @@ type Dependencies struct {
 	Stderr  io.Writer
 }
 
-const rootHelp = `Recallstack CLI
+// ExitError carries an exit code without printing anything more.
+type ExitError struct {
+	Code    int
+	Message string
+}
+
+func (e *ExitError) Error() string { return e.Message }
+
+// AsExit returns the exit code an error asks for (1 by default).
+func AsExit(err error) (int, string) {
+	var exit *ExitError
+	if errors.As(err, &exit) {
+		return exit.Code, exit.Message
+	}
+	return 1, err.Error()
+}
+
+const rootHelp = `Recallstack keeps your goals, decisions and taste, and briefs every agent with them.
 
 Usage:
   recallstack <command> [options]
 
-Commands:
-  login [code]        Sign in using a one-time code
-  logout              Sign out and clear local credentials
-  whoami              Show the authenticated account
-  config              Manage endpoint settings
-  workspace           Inspect accessible workspaces
-  project             Manage the local project target
-  memory              Ingest and retrieve memories
-  agent               Manage agent integrations
+Set up
+  login [--no-browser]      Sign in through the browser
+  logout                    Sign out on this computer
+  whoami                    Show who is signed in
+  agent install             Connect every agent on this computer
+  agent status              Show which agents are connected
+  agent uninstall <target>  Disconnect an agent
+  agent model [target]      Choose the model the local extraction pass uses
+  project                   Show the project for this folder
+  import                    Turn rules you wrote for agents into thoughts
+  brief                     Show exactly what the next session will be told
+  review                    Settle what needs you, one key at a time
+
+Thoughts
+  note <kind> "<what>"      Record a goal, focus, decision, question or taste
+  hold <ref> --plan "..."   Pause edits until the person answers
+  resolve <ref> <choice>    Settle a hold or a conflict
+  why <ref | "words">       Why something is the way it is
+  adjust <ref>              Narrow, reword or re-reason a thought
+  drop <ref>                End a thought
+  undo [<ref>]              Reverse the latest change
+
+Other
+  config base-url [url]     Point the CLI at another API
 
 Options:
   -h, --help           Show help
   -V, --version        Show version
 `
+
+var usage = map[string]string{
+	"login":           "recallstack login [--no-browser]",
+	"logout":          "recallstack logout",
+	"whoami":          "recallstack whoami [--json]",
+	"config":          "recallstack config <show|where|base-url>",
+	"config base-url": "recallstack config base-url [url] [--clear]",
+	"project":         "recallstack project [rename <name> | use <name>] [--json]",
+	"project rename":  "recallstack project rename <name>",
+	"project use":     "recallstack project use <name>",
+	"agent":           "recallstack agent <install|status|uninstall|model>",
+	"agent install":   "recallstack agent install [codex|claude|cursor|copilot|antigravity ...] [--repo] [--no-import] [--json]",
+	"agent uninstall": "recallstack agent uninstall <codex|claude|cursor|copilot|antigravity|all> [--repo]",
+	"agent status":    "recallstack agent status [--json]",
+	"agent model":     "recallstack agent model [codex|claude|copilot] [model] [--clear]",
+	"brief":           "recallstack brief [--agent <agent>] [--all] [--json]",
+	"import":          "recallstack import [<file>...] [--paste] [--yes | --review | --preview] [--json]",
+	"review":          "recallstack review [--all] [--json]",
+	"review settle":   "recallstack review settle <id> <confirm|confirm_all|adjust|drop|a|b|neither> [--text \"<words>\"] [--where <scope>] [--why \"<why>\"] [--json]",
+	"note":            "recallstack note <goal|focus|decision|question|taste> \"<what>\" [--why \"<why>\"] [--quote \"<the person's exact words>\"] [--instead-of \"<option>\"]... [--replaces <ref>] [--answers <ref>] [--where <scope>]",
+	"hold":            "recallstack hold <ref> --plan \"<one line>\"",
+	"resolve":         "recallstack resolve <hold-or-conflict ref> <choice> [--quote \"<the person's exact words>\"] [--text \"<one line>\"]",
+	"why":             "recallstack why <ref | \"words\"> [--project <name>] [--json]",
+	"adjust":          "recallstack adjust <ref> [--where <scope>] [--text \"<new wording>\"] [--why \"<reason>\"] --quote \"<the person's words>\"",
+	"drop":            "recallstack drop <ref> --quote \"<the person's words>\"",
+	"undo":            "recallstack undo [<ref>]",
+	"hook":            "recallstack hook run <agent> <event>",
+}
 
 func Run(args []string, deps Dependencies) error {
 	if deps.Stdin == nil || deps.Stdout == nil || deps.Stderr == nil {
@@ -49,17 +111,27 @@ func Run(args []string, deps Dependencies) error {
 		_, err := fmt.Fprintln(deps.Stdout, deps.Version)
 		return err
 	}
+	// Hooks and the hidden workers skip config and keyring loading entirely;
+	// they load it themselves only when they need the network.
+	switch args[0] {
+	case "hook":
+		return runHook(args[1:], deps)
+	case "__hook-worker", "__hook-retry", "__hook-refresh":
+		return runHiddenHook(args, deps)
+	}
 	if hasHelpFlag(args) {
 		_, err := io.WriteString(deps.Stdout, helpFor(args))
 		return err
 	}
-
 	args = rewriteAliases(args)
 	return runCommand(args, deps)
 }
 
 func hasHelpFlag(args []string) bool {
 	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
 		if arg == "--help" || arg == "-h" {
 			return true
 		}
@@ -70,54 +142,26 @@ func hasHelpFlag(args []string) bool {
 func helpFor(args []string) string {
 	path := make([]string, 0, len(args))
 	for _, arg := range args {
-		if arg == "--help" || arg == "-h" || strings.HasPrefix(arg, "-") {
+		if strings.HasPrefix(arg, "-") {
 			continue
 		}
 		path = append(path, arg)
-		if len(path) == 3 {
+		if len(path) == 2 {
 			break
 		}
 	}
-	if len(path) == 0 {
-		return rootHelp
-	}
-	usage := map[string]string{
-		"login":           "recallstack login [code]",
-		"logout":          "recallstack logout",
-		"whoami":          "recallstack whoami",
-		"config":          "recallstack config <show|where|base-url>",
-		"config base-url": "recallstack config base-url [url] [--clear]",
-		"workspace":       "recallstack workspace <list|use|show|clear>",
-		"project":         "recallstack project <show|where|clear|create|list|use|set>",
-		"project clear":   "recallstack project clear [--cwd <cwd>]",
-		"project create":  "recallstack project create --name <name> [--description <text>] [--workspace <workspace>]",
-		"memory":          "recallstack memory <ingest|query|source>",
-		"memory ingest":   "recallstack memory ingest (--file <path>|--stdin) [options]",
-		"memory query":    "recallstack memory query --query <query> [options]",
-		"memory source":   "recallstack memory source <ingest|query|get>",
-		"agent":           "recallstack agent <model|install|uninstall|status>",
-		"agent model":     "recallstack agent model [codex|claude|copilot] [model] [--clear] [--global]",
-		"agent install":   "recallstack agent install <codex|claude|cursor|copilot|antigravity|all> [options]",
-		"agent uninstall": "recallstack agent uninstall <codex|claude|cursor|copilot|antigravity|all> [options]",
-		"agent status":    "recallstack agent status [--cwd <cwd>] [--global]",
-	}
-	key := strings.Join(path, " ")
 	for len(path) > 0 {
-		if value, ok := usage[key]; ok {
+		if value, ok := usage[strings.Join(path, " ")]; ok {
 			return "Usage:\n  " + value + "\n"
 		}
 		path = path[:len(path)-1]
-		key = strings.Join(path, " ")
 	}
 	return rootHelp
 }
 
 func rewriteAliases(args []string) []string {
 	next := append([]string(nil), args...)
-	if len(next) > 0 && next[0] == "target" {
-		next[0] = "project"
-	}
-	if len(next) > 0 && (next[0] == "config" || next[0] == "workspace" || next[0] == "project") {
+	if len(next) > 0 && next[0] == "config" {
 		if len(next) == 1 || (strings.HasPrefix(next[1], "-") && next[1] != "--help" && next[1] != "-h") {
 			next = append(next[:1], append([]string{"show"}, next[1:]...)...)
 		}
@@ -126,33 +170,57 @@ func rewriteAliases(args []string) []string {
 }
 
 func runCommand(args []string, deps Dependencies) error {
-	if args[0] == "__hook-worker" || args[0] == "__hook-retry" {
-		return runHiddenHook(args, deps)
-	}
-	runtime, err := newRuntimeServices(deps)
+	r, err := newRuntimeServices(deps)
 	if err != nil {
 		return err
 	}
 	started := time.Now()
-	eventName, operation := telemetryCommand(args)
+	eventName := telemetryCommand(args)
+	flushes := map[string]bool{"note": true, "hold": true, "resolve": true, "why": true, "adjust": true, "drop": true, "undo": true, "brief": true, "import": true, "review": true}
+	if flushes[args[0]] && r.svc.SignedIn() && len(r.svc.Queue().List("")) > 0 {
+		// Writes that were waiting go first, so they land in order.
+		r.svc.FlushQuietly(3 * time.Second)
+	}
 	var commandErr error
 	switch args[0] {
 	case "login", "logout", "whoami":
-		commandErr = runtime.runAuth(args)
+		commandErr = r.runAuth(args)
 	case "config":
-		commandErr = runtime.runConfig(args[1:])
-	case "workspace":
-		commandErr = runtime.runWorkspace(args[1:])
+		commandErr = r.runConfig(args[1:])
 	case "project":
-		commandErr = runtime.runProject(args[1:])
-	case "memory":
-		commandErr = runtime.runMemory(args[1:])
+		commandErr = r.runProject(args[1:])
 	case "agent":
-		commandErr = runtime.runAgent(args[1:])
-	case "hook":
-		commandErr = runtime.runHook(args[1:])
+		commandErr = r.runAgent(args[1:])
+	case "brief":
+		commandErr = r.runBrief(args[1:])
+	case "import":
+		commandErr = r.runImport(args[1:])
+	case "note":
+		commandErr = r.runNote(args[1:])
+	case "hold":
+		commandErr = r.runHold(args[1:])
+	case "resolve":
+		commandErr = r.runResolve(args[1:])
+	case "why":
+		commandErr = r.runWhy(args[1:])
+	case "adjust":
+		commandErr = r.runAdjust(args[1:])
+	case "drop":
+		commandErr = r.runDrop(args[1:])
+	case "undo":
+		commandErr = r.runUndo(args[1:])
+	case "review":
+		commandErr = r.runReview(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q", strings.Join(args, " "))
+		return fmt.Errorf("unknown command %q. Run recallstack --help", strings.Join(args, " "))
+	}
+	if flushes[args[0]] {
+		for _, record := range r.svc.Queue().List("") {
+			if record.QueueReason != "auth_required" {
+				hooks.SpawnRetry()
+				break
+			}
+		}
 	}
 	if eventName != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -161,45 +229,24 @@ func runCommand(args []string, deps Dependencies) error {
 		if commandErr != nil {
 			outcome = "error"
 		}
-		telemetry.Emit(ctx, runtime.auth, &runtime.config, telemetry.Event{
-			Name: eventName, Operation: operation, Outcome: outcome, DurationMS: time.Since(started).Milliseconds(),
-		})
-		telemetry.EmitTrace(ctx, runtime.auth, &runtime.config, telemetry.Trace{
-			TraceID: runtime.traceID, SpanID: runtime.spanID, Name: operation,
-			ClientID: runtime.clientID, StartedAt: started, EndedAt: time.Now(), Outcome: outcome,
-		})
+		cfg, cfgErr := r.svc.Config()
+		if cfgErr == nil && (cfg.AccessToken != "" || cfg.APIKey != "") {
+			telemetry.Emit(ctx, r.svc.Auth, &cfg, telemetry.Event{
+				Name: eventName, Operation: eventName, Outcome: outcome, DurationMS: time.Since(started).Milliseconds(),
+			})
+		}
 	}
 	return commandErr
 }
 
-func telemetryCommand(args []string) (string, string) {
-	if len(args) == 0 {
-		return "", ""
-	}
+func telemetryCommand(args []string) string {
 	key := args[0]
 	if len(args) > 1 {
 		key += " " + args[1]
 	}
-	events := map[string]string{
+	return map[string]string{
 		"login":           "cli.auth.login",
-		"workspace use":   "cli.workspace.use",
-		"project use":     "cli.project.use",
-		"project set":     "cli.project.use",
-		"memory query":    "cli.memory.query",
-		"memory ingest":   "cli.memory.ingest",
 		"agent install":   "cli.agent.install",
 		"agent uninstall": "cli.agent.uninstall",
-		"agent status":    "cli.agent.status",
-	}
-	if len(args) > 2 && args[0] == "memory" && args[1] == "source" {
-		key = "memory source " + args[2]
-		events["memory source ingest"] = "cli.memory.source.ingest"
-		events["memory source query"] = "cli.memory.source.query"
-		events["memory source get"] = "cli.memory.source.get"
-	}
-	event := events[key]
-	if event == "" {
-		return "", ""
-	}
-	return event, event
+	}[key]
 }

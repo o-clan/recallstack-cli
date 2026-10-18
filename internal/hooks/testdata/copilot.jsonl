@@ -1,3 +1,0 @@
-{"type":"session.start","data":{"context":{"gitRoot":"REPOSITORY_ROOT"}}}
-{"type":"user.message","data":{"interactionId":"interaction-1","content":"Port Copilot hooks"}}
-{"type":"assistant.message","id":"assistant-1","data":{"interactionId":"interaction-1","messageId":"message-1","content":"Copilot hooks are native","toolRequests":[{"name":"terminal"}]}}

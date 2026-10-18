@@ -1,4 +1,0 @@
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Older request"}]}}
-{"type":"assistant","uuid":"assistant-old","message":{"role":"assistant","content":[{"type":"text","text":"Older response"}]}}
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Ship the native hook"}]}}
-{"type":"assistant","uuid":"assistant-new","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"},{"type":"text","text":"The native hook is ready"}]}}

@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/o-clan/recallstack-cli/internal/api"
 	"github.com/o-clan/recallstack-cli/internal/config"
 )
 
-var ErrNotAuthenticated = errors.New("Not authenticated. Run `recallstack login`.")
+var ErrNotAuthenticated = errors.New("Not signed in. Run recallstack login.")
 
 type ConfigStore interface {
 	Load(cwd string) (config.Config, error)
@@ -50,30 +49,15 @@ func (m *Manager) runtimeConfig(cfg *config.Config) (config.Config, error) {
 	return m.Store.Load(m.Cwd)
 }
 
-func (m *Manager) LoginWithCode(ctx context.Context, code string, cfg *config.Config) error {
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return errors.New("Sign-in code is required.")
-	}
-	runtimeConfig, err := m.runtimeConfig(cfg)
-	if err != nil {
-		return err
-	}
-	var response struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
-	err = m.client(runtimeConfig.EffectiveBaseURL).DoJSON(ctx, "/v1/auth/cli/code/exchange", api.RequestOptions{
-		Method: http.MethodPost,
-		Body:   map[string]any{"code": code},
-	}, &response)
-	if err != nil {
-		return err
-	}
-	return m.Store.UpdateProfile(runtimeConfig.EffectiveBaseURL, config.ProfilePatch{
-		AccessToken: config.String(response.AccessToken), RefreshToken: config.String(response.RefreshToken), APIKey: config.String(""),
+// SaveTokens stores the tokens a device sign-in returned (keyring first, file fallback).
+func (m *Manager) SaveTokens(baseURL, accessToken, refreshToken string) error {
+	return m.Store.UpdateProfile(baseURL, config.ProfilePatch{
+		AccessToken: config.String(accessToken), RefreshToken: config.String(refreshToken), APIKey: config.String(""),
 	})
 }
+
+// Client returns an unauthenticated API client for baseURL with the manager's headers.
+func (m *Manager) Client(baseURL string) *api.Client { return m.client(baseURL) }
 
 type LogoutResult struct {
 	RemoteRevoked bool

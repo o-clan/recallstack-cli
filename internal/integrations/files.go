@@ -1,6 +1,7 @@
 package integrations
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,22 +13,53 @@ import (
 
 type object = map[string]any
 
-func readJSON(path string) (object, error) {
+// ParseError is a config file Recallstack can't read. It is never overwritten.
+type ParseError struct {
+	Path   string
+	Line   int
+	Format string
+	Err    error
+}
+
+func (e *ParseError) Error() string {
+	if e.Line > 0 {
+		return fmt.Sprintf("%s isn't valid %s (line %d)", e.Path, e.Format, e.Line)
+	}
+	return fmt.Sprintf("%s isn't valid %s", e.Path, e.Format)
+}
+
+// WriteError is a config file Recallstack couldn't write.
+type WriteError struct {
+	Path string
+	Err  error
+}
+
+func (e *WriteError) Error() string { return fmt.Sprintf("couldn't write %s: %v", e.Path, e.Err) }
+
+func readJSON(path string) (object, bool, error) {
 	body, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return object{}, nil
+		return object{}, false, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, true, &WriteError{Path: path, Err: err}
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return object{}, true, nil
 	}
 	var value object
 	if err := json.Unmarshal(body, &value); err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		line := 0
+		var syntax *json.SyntaxError
+		if errors.As(err, &syntax) {
+			line = bytes.Count(body[:min(int(syntax.Offset), len(body))], []byte("\n")) + 1
+		}
+		return nil, true, &ParseError{Path: path, Line: line, Format: "JSON", Err: err}
 	}
 	if value == nil {
 		value = object{}
 	}
-	return value, nil
+	return value, true, nil
 }
 
 func writeJSON(path string, value any) error {
@@ -35,15 +67,17 @@ func writeJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	body = append(body, '\n')
-	return writeFile(path, body, 0o644)
+	return writeFile(path, append(body, '\n'), 0o644)
 }
 
 func writeFile(path string, body []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return &WriteError{Path: path, Err: err}
 	}
-	return os.WriteFile(path, body, mode)
+	if err := os.WriteFile(path, body, mode); err != nil {
+		return &WriteError{Path: path, Err: err}
+	}
+	return nil
 }
 
 func readText(path string) (string, error) {
@@ -51,7 +85,10 @@ func readText(path string) (string, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
-	return string(body), err
+	if err != nil {
+		return "", &WriteError{Path: path, Err: err}
+	}
+	return string(body), nil
 }
 
 func remove(path string) (bool, error) {
@@ -119,6 +156,7 @@ func stringField(value any, key string) string {
 	return text
 }
 
+// removeCommands drops entries (and nested hook entries) whose field matches.
 func removeCommands(entries []any, command func(string) bool, field string) ([]any, bool) {
 	changed := false
 	remaining := make([]any, 0, len(entries))
@@ -139,7 +177,10 @@ func removeCommands(entries []any, command func(string) bool, field string) ([]a
 				continue
 			}
 			if nestedChanged {
-				copyItem := cloneObject(item)
+				copyItem := make(object, len(item))
+				for key, value := range item {
+					copyItem[key] = value
+				}
 				copyItem["hooks"] = next
 				item = copyItem
 			}
@@ -149,12 +190,20 @@ func removeCommands(entries []any, command func(string) bool, field string) ([]a
 	return remaining, changed
 }
 
-func cloneObject(value object) object {
-	next := make(object, len(value))
-	for key, item := range value {
-		next[key] = item
+func entriesContain(entries []any, field string, matches func(string) bool) bool {
+	for _, entry := range entries {
+		item, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if matches(strings.TrimSpace(stringField(item, field))) {
+			return true
+		}
+		if entriesContain(asSlice(item["hooks"]), field, matches) {
+			return true
+		}
 	}
-	return next
+	return false
 }
 
 func isLegacyRecallstackCommand(command string) bool {
@@ -162,11 +211,6 @@ func isLegacyRecallstackCommand(command string) bool {
 	return strings.Contains(normalized, "recallstack.mjs") ||
 		strings.Contains(normalized, "recallstack.sh") ||
 		strings.Contains(normalized, ".codex/hooks/log-hook.sh")
-}
-
-func isNativeRecallstackCommand(command string) bool {
-	fields := strings.Fields(strings.TrimSpace(command))
-	return len(fields) >= 4 && fields[0] == "recallstack" && fields[1] == "hook" && fields[2] == "run"
 }
 
 func upsertTomlKey(content, section, key, value string) string {
@@ -187,9 +231,11 @@ func upsertTomlKey(content, section, key, value string) string {
 			return normalizeToml(lines)
 		}
 	}
-	lines = append(lines, "")
-	copy(lines[end+1:], lines[end:])
-	lines[end] = assignment
+	insertAt := end
+	for insertAt > start+1 && strings.TrimSpace(lines[insertAt-1]) == "" {
+		insertAt--
+	}
+	lines = append(lines[:insertAt], append([]string{assignment}, lines[insertAt:]...)...)
 	return normalizeToml(lines)
 }
 
@@ -197,7 +243,7 @@ func removeTomlKey(content, section, key string) string {
 	lines := splitNormalizedLines(content)
 	start, end := tomlSectionRange(lines, section)
 	if start < 0 {
-		return normalizeToml(lines)
+		return content
 	}
 	pattern := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=`)
 	next := append([]string{}, lines[:start+1]...)
@@ -218,7 +264,12 @@ func removeTomlKey(content, section, key string) string {
 			}
 		}
 		if !hasContent {
-			next = append(next[:newStart], next[newEnd:]...)
+			// Drop the empty section and the blank line before it.
+			cut := newStart
+			if cut > 0 && strings.TrimSpace(next[cut-1]) == "" {
+				cut--
+			}
+			next = append(next[:cut], next[newEnd:]...)
 		}
 	}
 	return normalizeToml(next)
@@ -230,7 +281,7 @@ func tomlKeyEnabled(content, section, key, expected string) bool {
 	if start < 0 {
 		return false
 	}
-	pattern := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=\s*` + regexp.QuoteMeta(expected) + `\s*$`)
+	pattern := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=\s*` + regexp.QuoteMeta(expected) + `\s*(#.*)?$`)
 	for _, line := range lines[start+1 : end] {
 		if pattern.MatchString(line) {
 			return true
@@ -279,60 +330,4 @@ func normalizeToml(lines []string) string {
 		return ""
 	}
 	return strings.Join(lines, "\n") + "\n"
-}
-
-func trimOutput(value string, limit int) string {
-	value = strings.TrimSpace(value)
-	if len(value) <= limit {
-		return value
-	}
-	return value[:limit-3] + "..."
-}
-
-const (
-	managedInstructionsStart = "<!-- recallstack:instructions:start -->"
-	managedInstructionsEnd   = "<!-- recallstack:instructions:end -->"
-)
-
-func mergeManagedInstructions(current string, instructions []byte) string {
-	body := strings.TrimSpace(string(instructions))
-	managed := managedInstructionsStart + "\n" + body + "\n" + managedInstructionsEnd
-	trimmed := strings.TrimSpace(current)
-	// The TypeScript CLI owned the whole file. Convert that exact legacy output
-	// to a managed section so future installs can coexist with repository guidance.
-	if trimmed == body || trimmed == "" {
-		return managed + "\n"
-	}
-	start := strings.Index(current, managedInstructionsStart)
-	end := strings.Index(current, managedInstructionsEnd)
-	if start >= 0 && end >= start {
-		end += len(managedInstructionsEnd)
-		return current[:start] + managed + current[end:]
-	}
-	separator := "\n\n"
-	if strings.HasSuffix(current, "\n\n") {
-		separator = ""
-	} else if strings.HasSuffix(current, "\n") {
-		separator = "\n"
-	}
-	return current + separator + managed + "\n"
-}
-
-func removeManagedInstructions(current string) (string, bool) {
-	start := strings.Index(current, managedInstructionsStart)
-	end := strings.Index(current, managedInstructionsEnd)
-	if start < 0 || end < start {
-		// Support uninstalling the exact whole-file output from the TypeScript CLI.
-		if strings.TrimSpace(current) == strings.TrimSpace(string(copilotInstructions)) {
-			return "", true
-		}
-		return current, false
-	}
-	end += len(managedInstructionsEnd)
-	next := current[:start] + current[end:]
-	next = strings.TrimSpace(next)
-	if next == "" {
-		return "", true
-	}
-	return next + "\n", true
 }

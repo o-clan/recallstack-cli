@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/o-clan/recallstack-cli/internal/state"
 	keyring "github.com/zalando/go-keyring"
 )
 
@@ -104,14 +105,16 @@ func (systemSecureStore) Delete(service, account string) error {
 }
 
 type Store struct {
-	HomeDir     string
+	HomeDir string
+	// Root, when set, is the Recallstack state root ($RECALLSTACK_HOME or
+	// ~/.recallstack). It wins over HomeDir.
+	Root        string
 	SecureStore SecureStore
 	GOOS        string
 }
 
 func NewStore() *Store {
-	home, _ := os.UserHomeDir()
-	return &Store{HomeDir: home, SecureStore: systemSecureStore{}, GOOS: runtime.GOOS}
+	return &Store{HomeDir: state.Home(), Root: state.Root(), SecureStore: systemSecureStore{}, GOOS: runtime.GOOS}
 }
 
 func (s *Store) homeDir() string {
@@ -123,6 +126,9 @@ func (s *Store) homeDir() string {
 }
 
 func (s *Store) globalPath() string {
+	if strings.TrimSpace(s.Root) != "" {
+		return filepath.Join(s.Root, "config.json")
+	}
 	return filepath.Join(s.homeDir(), ".recallstack", "config.json")
 }
 
@@ -138,14 +144,8 @@ func (s *Store) Resolve(cwd string) Resolved {
 	if strings.TrimSpace(cwd) == "" {
 		cwd, _ = os.Getwd()
 	}
-	root := findProjectRoot(cwd, s.homeDir())
-	if root == "" {
-		return Resolved{Scope: ScopeGlobal, ScopeRoot: s.homeDir(), Path: s.globalPath(), GlobalPath: s.globalPath()}
-	}
-	return Resolved{
-		Scope: ScopeProject, ScopeRoot: root,
-		Path: filepath.Join(root, ".recallstack", "config.json"), GlobalPath: s.globalPath(),
-	}
+	// Recallstack no longer keeps config inside repositories: one file, per person.
+	return Resolved{Scope: ScopeGlobal, ScopeRoot: s.homeDir(), Path: s.globalPath(), GlobalPath: s.globalPath()}
 }
 
 func (s *Store) ResolveScope(cwd string, scope Scope) Resolved {
@@ -153,29 +153,6 @@ func (s *Store) ResolveScope(cwd string, scope Scope) Resolved {
 		return Resolved{Scope: ScopeGlobal, ScopeRoot: s.homeDir(), Path: s.globalPath(), GlobalPath: s.globalPath()}
 	}
 	return s.Resolve(cwd)
-}
-
-func findProjectRoot(start, home string) string {
-	cursor, err := filepath.Abs(start)
-	if err != nil {
-		return ""
-	}
-	homeAbs, _ := filepath.Abs(home)
-	for {
-		if cursor != homeAbs && (fileExists(filepath.Join(cursor, ".recallstack", "config.json")) || fileExists(filepath.Join(cursor, ".recallstack", "workspace.json"))) {
-			return cursor
-		}
-		parent := filepath.Dir(cursor)
-		if parent == cursor {
-			return ""
-		}
-		cursor = parent
-	}
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }
 
 type globalFile struct {

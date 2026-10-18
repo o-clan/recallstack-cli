@@ -16,7 +16,10 @@ func main() {
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 	}); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		code, message := cli.AsExit(err)
+		if message != "" {
+			fmt.Fprintln(os.Stderr, message)
+		}
+		os.Exit(code)
 	}
 }
